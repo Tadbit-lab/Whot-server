@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const admin = require('firebase-admin');
 
 // ─── Config ───
 const PORT = process.env.PORT || 3001;
@@ -12,30 +11,42 @@ const FOURTEEN_MINUTES_MS = 14 * 60 * 1000;
 
 // ─── Firebase Admin Init ───
 let firebaseReady = false;
+let db = null;
+let auth = null;
+let FieldValue = null;
+
 try {
     let serviceAccount;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         // Production (Render / Railway / etc.)
-        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT === 'string'
+            ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+            : process.env.FIREBASE_SERVICE_ACCOUNT;
     } else {
         // Local development
         serviceAccount = require('./serviceAccountKey.json');
     }
 
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
+    // Modern v11/v12 Firebase Admin SDK imports (Node v20/v22+ compatible)
+    const { initializeApp, cert } = require('firebase-admin/app');
+    const { getFirestore, FieldValue: fv } = require('firebase-admin/firestore');
+    const { getAuth } = require('firebase-admin/auth');
+
+    initializeApp({
+        credential: cert(serviceAccount),
     });
 
+    db = getFirestore();
+    auth = getAuth();
+    FieldValue = fv;
+
     firebaseReady = true;
-    console.log('🔥 Firebase Admin SDK initialized');
+    console.log('🔥 Firebase Admin SDK initialized successfully!');
 } catch (err) {
     console.warn('⚠️ Firebase Admin not initialized:', err.message);
     console.warn('   Server will still run, but token verification & Firestore writes are disabled.');
 }
-
-const db = firebaseReady ? admin.firestore() : null;
-const auth = firebaseReady ? admin.auth() : null;
 
 // ─── Express + Socket.io ───
 const app = express();
@@ -83,7 +94,6 @@ async function verifyPlayerToken(idToken) {
 
 // ─── Self-Ping Keep-Alive (Prevents Render Sleeping) ───
 function startSelfPing() {
-    // Render automatically sets RENDER_EXTERNAL_URL. You can also set SERVER_URL manually.
     const targetUrl = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL;
 
     if (!targetUrl) {
@@ -112,7 +122,7 @@ function startSelfPing() {
 app.get('/', (req, res) => {
     res.json({
         name: 'Whot Game Server',
-        version: '1.3.0',
+        version: '1.4.0',
         status: 'online',
         firebaseReady,
         message: 'Whot backend is running. Connect via Socket.io for gameplay.',
@@ -190,12 +200,17 @@ io.on('connection', (socket) => {
 
             if (firebaseReady && playerData.idToken) {
                 const decoded = await verifyPlayerToken(playerData.idToken);
-                uid = decoded.uid;
-                email = decoded.email || '';
-                name =
-                    decoded.name ||
-                    playerData.name ||
-                    (email ? email.split('@')[0] : 'Player');
+                if (decoded) {
+                    uid = decoded.uid;
+                    email = decoded.email || '';
+                    name =
+                        decoded.name ||
+                        playerData.name ||
+                        (email ? email.split('@')[0] : 'Player');
+                } else {
+                    uid = playerData.uid ? playerData.uid.trim() : socket.id;
+                    name = playerData.name ? playerData.name.trim() : 'Player';
+                }
             } else {
                 if (!isNonEmptyString(playerData.name) || !isNonEmptyString(playerData.uid)) {
                     const errMsg = 'Name and uid are required when Firebase token is not provided.';
@@ -321,7 +336,7 @@ io.on('connection', (socket) => {
                 winnerUid: data.winnerUid,
             });
 
-            if (db && game) {
+            if (db && FieldValue && game) {
                 try {
                     await db.collection('matches').add({
                         roomId: data.roomId,
@@ -330,7 +345,7 @@ io.on('connection', (socket) => {
                             name: p.name,
                         })),
                         winnerUid: data.winnerUid || null,
-                        playedAt: admin.firestore.FieldValue.serverTimestamp(),
+                        playedAt: FieldValue.serverTimestamp(),
                     });
                     log('💾', `Match saved to Firestore: ${data.roomId}`);
                 } catch (saveErr) {
@@ -394,6 +409,22 @@ io.on('connection', (socket) => {
             log('💥', `disconnect cleanup error: ${err.message}`);
         }
     });
+
+    socket.onAny((event) => {
+        const knownEvents = [
+            'join_queue',
+            'leave_queue',
+            'play_card',
+            'draw_card',
+            'call_whot',
+            'game_over',
+            'get_admin_data',
+            'disconnect',
+        ];
+        if (!knownEvents.includes(event)) {
+            log('⚠️', `Unknown event "${event}" from ${socket.id}`);
+        }
+    });
 });
 
 // ─── Graceful Shutdown ───
@@ -431,6 +462,5 @@ server.listen(PORT, () => {
         }`
     );
 
-    // Start self-pinging loop
     startSelfPing();
 });
