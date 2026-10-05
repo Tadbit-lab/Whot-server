@@ -197,19 +197,21 @@ io.on('connection', (socket) => {
             let uid = '';
             let name = '';
             let email = '';
+            let photoURL = null;
 
             if (firebaseReady && playerData.idToken) {
                 const decoded = await verifyPlayerToken(playerData.idToken);
                 if (decoded) {
                     uid = decoded.uid;
                     email = decoded.email || '';
-                    name =
-                        decoded.name ||
-                        playerData.name ||
-                        (email ? email.split('@')[0] : 'Player');
+                    name = playerData.name || decoded.name || (email ? email.split('@')[0] : 'Player');
+                    photoURL = isNonEmptyString(playerData.photoURL, 2048)
+                        ? playerData.photoURL
+                        : (decoded.picture || null);
                 } else {
                     uid = playerData.uid ? playerData.uid.trim() : socket.id;
                     name = playerData.name ? playerData.name.trim() : 'Player';
+                    photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : null;
                 }
             } else {
                 if (!isNonEmptyString(playerData.name) || !isNonEmptyString(playerData.uid)) {
@@ -219,9 +221,10 @@ io.on('connection', (socket) => {
                 }
                 uid = playerData.uid.trim();
                 name = playerData.name.trim();
+                photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : null;
             }
 
-            socket.playerData = { uid, name, email };
+            socket.playerData = { uid, name, email, photoURL };
 
             if (queue.length > 0) {
                 const opponent = queue.shift();
@@ -325,31 +328,97 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('voice_offer', (data) => {
+        if (!validateRoomAction(data) || !data.sdp || !isNonEmptyString(data.sdp.sdp, 10000)) {
+            socket.emit('action_error', { error: 'Invalid voice offer or room membership.' });
+            return;
+        }
+        socket.to(data.roomId).emit('voice_offer', { roomId: data.roomId, sdp: data.sdp });
+    });
+
+    socket.on('voice_answer', (data) => {
+        if (!validateRoomAction(data) || !data.sdp || !isNonEmptyString(data.sdp.sdp, 10000)) {
+            socket.emit('action_error', { error: 'Invalid voice answer or room membership.' });
+            return;
+        }
+        socket.to(data.roomId).emit('voice_answer', { roomId: data.roomId, sdp: data.sdp });
+    });
+
+    socket.on('ice_candidate', (data) => {
+        if (!validateRoomAction(data) || !data.candidate || typeof data.candidate.candidate !== 'string' || data.candidate.candidate.length > 4096) {
+            socket.emit('action_error', { error: 'Invalid ICE candidate or room membership.' });
+            return;
+        }
+        socket.to(data.roomId).emit('ice_candidate', { roomId: data.roomId, candidate: data.candidate });
+    });
+
     socket.on('game_over', async (data) => {
         try {
             if (!validateRoomAction(data)) return;
 
             const game = activeGames[data.roomId];
+            const winnerUid = data.winnerUid || data.winnerId;
+            if (game.ending) return;
+            if (!isNonEmptyString(winnerUid, 200) || !game.players.some((player) => player.uid === winnerUid)) {
+                socket.emit('action_error', { error: 'Winner must be a player in this room.' });
+                return;
+            }
+            game.ending = true;
 
             io.to(data.roomId).emit('game_ended', {
                 roomId: data.roomId,
-                winnerUid: data.winnerUid,
+                winnerUid,
             });
 
             if (db && FieldValue && game) {
                 try {
-                    await db.collection('matches').add({
-                        roomId: data.roomId,
-                        players: game.players.map((p) => ({
-                            uid: p.uid,
-                            name: p.name,
-                        })),
-                        winnerUid: data.winnerUid || null,
-                        playedAt: FieldValue.serverTimestamp(),
+                    const playersByUid = new Map(
+                        game.players
+                            .filter((player) => isNonEmptyString(player.uid, 200))
+                            .map((player) => [player.uid, player])
+                    );
+                    const players = [...playersByUid.values()];
+                    const userRefs = players.map((player) => db.collection('users').doc(player.uid));
+                    const matchRef = db.collection('matches').doc();
+                    const updatedAt = new Date().toISOString();
+
+                    await db.runTransaction(async (transaction) => {
+                        const userSnapshots = await Promise.all(userRefs.map((userRef) => transaction.get(userRef)));
+                        transaction.set(matchRef, {
+                            roomId: data.roomId,
+                            players: game.players.map((player) => ({
+                                uid: player.uid,
+                                name: player.name,
+                                ...(player.photoURL ? { photoURL: player.photoURL } : {}),
+                            })),
+                            winnerUid,
+                            playedAt: FieldValue.serverTimestamp(),
+                        });
+
+                        userRefs.forEach((userRef, index) => {
+                            const player = players[index];
+                            const userData = userSnapshots[index].exists ? userSnapshots[index].data() : {};
+                            const isWinner = player.uid === winnerUid;
+                            const winStreak = typeof userData.winStreak === 'number' ? userData.winStreak : 0;
+                            const bestWinStreak = typeof userData.bestWinStreak === 'number' ? userData.bestWinStreak : 0;
+                            transaction.set(userRef, {
+                                uid: player.uid,
+                                displayName: player.name,
+                                ...(player.email ? { email: player.email } : {}),
+                                ...(player.photoURL ? { photoURL: player.photoURL } : {}),
+                                wins: FieldValue.increment(isWinner ? 1 : 0),
+                                losses: FieldValue.increment(isWinner ? 0 : 1),
+                                matchesPlayed: FieldValue.increment(1),
+                                winStreak: isWinner ? FieldValue.increment(1) : 0,
+                                bestWinStreak: isWinner ? Math.max(bestWinStreak, winStreak + 1) : bestWinStreak,
+                                updatedAt,
+                                lastPlayedAt: updatedAt,
+                            }, { merge: true });
+                        });
                     });
-                    log('💾', `Match saved to Firestore: ${data.roomId}`);
+                    log('💾', `Match and leaderboard stats saved: ${data.roomId}`);
                 } catch (saveErr) {
-                    log('⚠️', `Failed to save match: ${saveErr.message}`);
+                    log('⚠️', `Failed to save match and stats: ${saveErr.message}`);
                 }
             }
 
@@ -417,6 +486,9 @@ io.on('connection', (socket) => {
             'play_card',
             'draw_card',
             'call_whot',
+            'voice_offer',
+            'voice_answer',
+            'ice_candidate',
             'game_over',
             'get_admin_data',
             'disconnect',
