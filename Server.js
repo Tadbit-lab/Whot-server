@@ -6,8 +6,9 @@ const admin = require('firebase-admin');
 
 // ─── Config ───
 const PORT = process.env.PORT || 3001;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'whot-admin-2024'; // change in production
+const ADMIN_KEY = process.env.ADMIN_KEY || 'whot-admin-2024';
 const MAX_PLAYERS_PER_ROOM = 6;
+const FOURTEEN_MINUTES_MS = 14 * 60 * 1000;
 
 // ─── Firebase Admin Init ───
 let firebaseReady = false;
@@ -15,11 +16,10 @@ try {
     let serviceAccount;
 
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        // Production (Railway / Render / etc.)
+        // Production (Render / Railway / etc.)
         serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     } else {
         // Local development
-        // Make sure serviceAccountKey.json exists in whot-server/
         serviceAccount = require('./serviceAccountKey.json');
     }
 
@@ -45,7 +45,7 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: '*', // later: put your Vercel URL here
+        origin: '*',
         methods: ['GET', 'POST'],
     },
 });
@@ -74,21 +74,45 @@ function getServerStats() {
 }
 
 async function verifyPlayerToken(idToken) {
-    if (!auth) {
-        // Firebase not configured — allow local testing with payload fields
-        return null;
-    }
+    if (!auth) return null;
     if (!isNonEmptyString(idToken, 2000)) {
         throw new Error('Missing or invalid Firebase ID token');
     }
     return auth.verifyIdToken(idToken);
 }
 
+// ─── Self-Ping Keep-Alive (Prevents Render Sleeping) ───
+function startSelfPing() {
+    // Render automatically sets RENDER_EXTERNAL_URL. You can also set SERVER_URL manually.
+    const targetUrl = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL;
+
+    if (!targetUrl) {
+        log('ℹ️', 'No RENDER_EXTERNAL_URL or SERVER_URL found. Self-ping skipped (normal for local dev).');
+        return;
+    }
+
+    const healthEndpoint = `${targetUrl.replace(/\/$/, '')}/health`;
+    log('⏰', `Self-ping keep-alive enabled! Target: ${healthEndpoint} (Every 14 minutes)`);
+
+    setInterval(async () => {
+        try {
+            const response = await fetch(healthEndpoint);
+            if (response.ok) {
+                log('🏓', 'Self-ping successful. Server kept awake!');
+            } else {
+                log('⚠️', `Self-ping responded with status: ${response.status}`);
+            }
+        } catch (err) {
+            log('⚠️', `Self-ping failed: ${err.message}`);
+        }
+    }, FOURTEEN_MINUTES_MS);
+}
+
 // ─── REST API Routes ───
 app.get('/', (req, res) => {
     res.json({
         name: 'Whot Game Server',
-        version: '1.2.0',
+        version: '1.3.0',
         status: 'online',
         firebaseReady,
         message: 'Whot backend is running. Connect via Socket.io for gameplay.',
@@ -123,25 +147,22 @@ app.get('/api/rooms', (req, res) => {
     res.json({ rooms, ...getServerStats() });
 });
 
-// 404
+// 404 Handler
 app.use((req, res) => {
     res.status(404).json({ error: 'Route not found', path: req.originalUrl });
 });
 
-// Express error handler
+// Express Error Handler
 app.use((err, req, res, next) => {
     log('💥', `Express error: ${err.message}`);
     res.status(500).json({ error: 'Internal server error' });
 });
 
-// ─── Socket.io ───
+// ─── Socket.io Gameplay ───
 io.on('connection', (socket) => {
     log('🟢', `Player connected: ${socket.id}`);
 
-    // ── Join matchmaking ──
-    // Preferred payload:
-    // { idToken, name?, uid? }
-    // If Firebase is enabled, idToken is verified and uid/name come from Firebase.
+    // Join matchmaking
     socket.on('join_queue', async (playerData, callback) => {
         try {
             if (!playerData || typeof playerData !== 'object') {
@@ -150,13 +171,11 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // Prevent double queue
             if (queue.some((q) => q.socket.id === socket.id)) {
                 if (typeof callback === 'function') callback({ error: 'You are already in the queue.' });
                 return;
             }
 
-            // Prevent join while already in a room
             const existingRoom = Object.values(activeGames).find((g) =>
                 g.players.some((p) => p.socketId === socket.id)
             );
@@ -169,7 +188,6 @@ io.on('connection', (socket) => {
             let name = '';
             let email = '';
 
-            // Verify Firebase token if available
             if (firebaseReady && playerData.idToken) {
                 const decoded = await verifyPlayerToken(playerData.idToken);
                 uid = decoded.uid;
@@ -179,7 +197,6 @@ io.on('connection', (socket) => {
                     playerData.name ||
                     (email ? email.split('@')[0] : 'Player');
             } else {
-                // Local/dev fallback (no Firebase token)
                 if (!isNonEmptyString(playerData.name) || !isNonEmptyString(playerData.uid)) {
                     const errMsg = 'Name and uid are required when Firebase token is not provided.';
                     if (typeof callback === 'function') callback({ error: errMsg });
@@ -205,7 +222,6 @@ io.on('connection', (socket) => {
                     { socketId: socket.id, ...socket.playerData, isHost: false },
                 ];
 
-                // Optional: cap room size later for 2–6 player lobbies
                 if (roomPlayers.length > MAX_PLAYERS_PER_ROOM) {
                     if (typeof callback === 'function') callback({ error: 'Room is full.' });
                     return;
@@ -242,7 +258,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Leave queue
     socket.on('leave_queue', () => {
         const idx = queue.findIndex((q) => q.socket.id === socket.id);
         if (idx !== -1) {
@@ -295,7 +310,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Game over + optional Firestore save
     socket.on('game_over', async (data) => {
         try {
             if (!validateRoomAction(data)) return;
@@ -307,7 +321,6 @@ io.on('connection', (socket) => {
                 winnerUid: data.winnerUid,
             });
 
-            // Save match history if Firebase is ready
             if (db && game) {
                 try {
                     await db.collection('matches').add({
@@ -332,7 +345,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Admin data over socket
     socket.on('get_admin_data', (data, callback) => {
         try {
             if (data && data.adminKey && data.adminKey !== ADMIN_KEY) {
@@ -356,7 +368,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Disconnect cleanup
     socket.on('disconnect', (reason) => {
         try {
             const qIdx = queue.findIndex((q) => q.socket.id === socket.id);
@@ -383,25 +394,9 @@ io.on('connection', (socket) => {
             log('💥', `disconnect cleanup error: ${err.message}`);
         }
     });
-
-    socket.onAny((event) => {
-        const knownEvents = [
-            'join_queue',
-            'leave_queue',
-            'play_card',
-            'draw_card',
-            'call_whot',
-            'game_over',
-            'get_admin_data',
-            'disconnect',
-        ];
-        if (!knownEvents.includes(event)) {
-            log('⚠️', `Unknown event "${event}" from ${socket.id}`);
-        }
-    });
 });
 
-// ─── Graceful shutdown ───
+// ─── Graceful Shutdown ───
 function shutdown(signal) {
     log('🛑', `${signal} received. Shutting down gracefully...`);
     io.emit('server_shutdown', {
@@ -427,6 +422,7 @@ server.on('error', (err) => {
     process.exit(1);
 });
 
+// ─── Start Server & Activate Keep-Alive ───
 server.listen(PORT, () => {
     log('🚀', `Whot Backend Server running on http://localhost:${PORT}`);
     log(
@@ -434,4 +430,7 @@ server.listen(PORT, () => {
         `REST: /  /health  /api/stats  /api/rooms?key=${ADMIN_KEY === 'whot-admin-2024' ? 'whot-admin-2024' : '<your-key>'
         }`
     );
+
+    // Start self-pinging loop
+    startSelfPing();
 });
