@@ -92,6 +92,104 @@ async function verifyPlayerToken(idToken) {
     return auth.verifyIdToken(idToken);
 }
 
+const DEFAULT_SETTINGS = { minPlayers: 2, maxPlayers: 6, startingHandSize: 6, decks: 1 };
+const ADMIN_EMAIL = String(process.env.VITE_ADMIN_EMAIL || process.env.ADMIN_EMAIL || '').toLowerCase();
+const CARD_RANKS = {
+    circles: [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 14],
+    triangles: [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 14],
+    crosses: [1, 2, 3, 5, 7, 8, 10, 11, 12, 14],
+    squares: [1, 2, 3, 5, 7, 8, 10, 11, 12, 14],
+    stars: [1, 2, 3, 4, 5, 7, 8],
+};
+const ACTION_LABELS = { 1: 'HOLD ON', 2: 'PICK TWO', 5: 'PICK THREE', 8: 'SUSPENSION', 14: 'GENERAL MARKET', 20: 'WHOT' };
+function buildDeckPool(deckCount) {
+    const deck = [];
+    for (let copy = 0; copy < deckCount; copy += 1) {
+        for (const [suit, ranks] of Object.entries(CARD_RANKS)) {
+            ranks.forEach((value, index) => deck.push({
+                id: `${copy}-${suit}-${value}-${index}`,
+                suit, value, label: ACTION_LABELS[value] || String(value),
+                isAction: [1, 2, 5, 8, 14].includes(value), isWild: false,
+            }));
+        }
+        for (let index = 0; index < 5; index += 1) deck.push({
+            id: `${copy}-whot-${index}`, suit: 'whot', value: 20, label: ACTION_LABELS[20], isAction: false, isWild: true,
+        });
+    }
+    return deck;
+}
+function shuffleCards(cards) {
+    for (let index = cards.length - 1; index > 0; index -= 1) {
+        const otherIndex = Math.floor(Math.random() * (index + 1));
+        [cards[index], cards[otherIndex]] = [cards[otherIndex], cards[index]];
+    }
+    return cards;
+}
+function createDeal(room) {
+    const deck = shuffleCards(buildDeckPool(room.settings.decks));
+    const handsByUid = {};
+    for (const player of room.players) handsByUid[player.uid] = deck.splice(0, room.settings.startingHandSize);
+    let openerIndex = deck.findIndex((card) => !card.isAction && !card.isWild);
+    if (openerIndex < 0) openerIndex = 0;
+    const discardTop = deck.splice(openerIndex, 1)[0];
+    room.handsByUid = handsByUid;
+    room.market = deck;
+    room.discardPile = [discardTop];
+    room.activeSuit = null;
+    room.pendingPenalty = 0;
+    room.penaltyType = null;
+    room.playedCount = 0;
+    room.status = 'playing';
+    return { handsByUid, discardTop, marketCount: deck.length };
+}
+function publicRoom(room) {
+    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin }) => ({ uid, name, photoURL, isHost, isAdmin })),
+        state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
+}
+function broadcastRoom(room) { io.to(room.roomId).emit('room_updated', publicRoom(room)); }
+function suggestSettings(playerCount) {
+    if (playerCount >= 5) return { startingHandSize: 4, decks: 2 };
+    if (playerCount >= 3) return { startingHandSize: 5, decks: 1 };
+    return { startingHandSize: 6, decks: 1 };
+}
+function gameSnapshot(room) {
+    return {
+        roomId: room.roomId,
+        players: publicRoom(room).players,
+        handCounts: Object.fromEntries(room.players.map((player) => [player.uid, (room.handsByUid[player.uid] || []).length])),
+        currentTurnUid: room.players[room.turnIndex]?.uid || '',
+        currentTurnIndex: room.turnIndex,
+        discardTop: room.discardPile[room.discardPile.length - 1],
+        activeSuit: room.activeSuit,
+        pendingPenalty: room.pendingPenalty,
+        penaltyType: room.penaltyType,
+        marketCount: room.market.length,
+        status: room.status || room.state,
+        winnerUid: room.winnerUid,
+        playedCount: room.playedCount,
+    };
+}
+function broadcastGameState(room) {
+    io.to(room.roomId).emit('game_state', gameSnapshot(room));
+    room.players.forEach((player) => io.to(player.socketId).emit('hand_update', { roomId: room.roomId, hand: room.handsByUid[player.uid] || [] }));
+}
+function recycleMarket(room) {
+    if (room.market.length || room.discardPile.length <= 1) return;
+    const topCard = room.discardPile.pop();
+    room.market = shuffleCards(room.discardPile);
+    room.discardPile = [topCard];
+}
+function drawFromMarket(room, uid, count = 1) {
+    const hand = room.handsByUid[uid] || (room.handsByUid[uid] = []);
+    for (let index = 0; index < count; index += 1) {
+        recycleMarket(room);
+        const card = room.market.pop();
+        if (!card) break;
+        hand.push(card);
+    }
+    return hand;
+}
+
 // ─── Self-Ping Keep-Alive (Prevents Render Sleeping) ───
 function startSelfPing() {
     const targetUrl = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL;
@@ -172,6 +270,124 @@ app.use((err, req, res, next) => {
 io.on('connection', (socket) => {
     log('🟢', `Player connected: ${socket.id}`);
 
+    async function resolveRoomPlayer(playerData) {
+        if (!playerData || typeof playerData !== 'object') throw new Error('Invalid player data.');
+        let decoded = null;
+        if (firebaseReady) decoded = await verifyPlayerToken(playerData.idToken);
+        const uid = decoded?.uid || (isNonEmptyString(playerData.uid, 200) ? playerData.uid.trim() : '');
+        if (!uid) throw new Error('Unable to verify player identity.');
+        const email = decoded?.email || '';
+        const name = playerData.name || decoded?.name || (email ? email.split('@')[0] : 'Player');
+        const photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : (decoded?.picture || null);
+        const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+        socket.playerData = { uid, name, email, photoURL, isAdmin };
+        return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id };
+    }
+
+    socket.on('create_room', async (playerData, callback) => {
+        try {
+            const player = await resolveRoomPlayer(playerData);
+            const roomId = String(playerData.roomId || '').trim().toUpperCase();
+            if (!isNonEmptyString(roomId, 24)) throw new Error('A valid room code is required.');
+            if (activeGames[roomId]) throw new Error('That room code is already in use.');
+            player.isHost = true;
+            const room = activeGames[roomId] = { roomId, hostUid: player.uid, players: [player], state: 'waiting',
+                settings: { ...DEFAULT_SETTINGS }, turnIndex: 0, createdAt: new Date().toISOString() };
+            socket.join(roomId);
+            socket.data.roomId = roomId;
+            broadcastRoom(room);
+            if (typeof callback === 'function') callback({ success: true, roomId });
+        } catch (error) {
+            socket.emit('action_error', { error: error.message });
+            if (typeof callback === 'function') callback({ error: error.message });
+        }
+    });
+
+    socket.on('join_room', async (playerData, callback) => {
+        try {
+            const player = await resolveRoomPlayer(playerData);
+            const roomId = String(playerData.roomId || '').trim().toUpperCase();
+            const room = activeGames[roomId];
+            if (!room || room.state !== 'waiting') throw new Error('Room not found or game already started.');
+            if (room.players.length >= room.settings.maxPlayers) throw new Error('Room is full (6 players maximum).');
+            if (room.players.some((existing) => existing.uid === player.uid)) throw new Error('You are already in this room.');
+            Object.assign(room.settings, suggestSettings(room.players.length + 1));
+            room.players.push(player);
+            socket.join(roomId);
+            socket.data.roomId = roomId;
+            broadcastRoom(room);
+            if (typeof callback === 'function') callback({ success: true, roomId });
+        } catch (error) {
+            socket.emit('action_error', { error: error.message });
+            if (typeof callback === 'function') callback({ error: error.message });
+        }
+    });
+
+    socket.on('update_room_settings', (data) => {
+        const room = data && activeGames[data.roomId];
+        if (!room || room.state !== 'waiting' || !room.players.some((player) => player.socketId === socket.id && player.uid === room.hostUid)) {
+            socket.emit('action_error', { error: 'Only the host can change settings before the game starts.' });
+            return;
+        }
+        const handSize = Number(data.startingHandSize);
+        const decks = Number(data.decks);
+        if (![4, 5, 6, 7, 8].includes(handSize) || ![1, 2].includes(decks)) {
+            socket.emit('action_error', { error: 'Choose 4–8 starting cards and 1 or 2 decks.' });
+            return;
+        }
+        room.settings = { ...room.settings, startingHandSize: handSize, decks };
+        broadcastRoom(room);
+    });
+
+    socket.on('start_game', (data) => {
+        const room = data && activeGames[data.roomId];
+        if (!room || room.state !== 'waiting' || !room.players.some((player) => player.socketId === socket.id && player.uid === room.hostUid)) {
+            socket.emit('action_error', { error: 'Only the host can start this room.' });
+            return;
+        }
+        const playerCount = room.players.length;
+        const neededCards = playerCount * room.settings.startingHandSize + 1;
+        const deckSize = 54 * room.settings.decks;
+        if (playerCount < 2 || playerCount > 6 || neededCards >= deckSize || (playerCount >= 5 && room.settings.startingHandSize >= 7 && room.settings.decks < 2)) {
+            socket.emit('action_error', { error: 'Not enough cards for this setup. Choose fewer cards or 2 decks.' });
+            return;
+        }
+        room.state = 'playing';
+        const startingPlayerIndex = Math.floor(Math.random() * playerCount);
+        room.turnIndex = startingPlayerIndex;
+        const deal = createDeal(room);
+        if (deal.discardTop.value === 2) { room.pendingPenalty = 2; room.penaltyType = 'two'; }
+        else if (deal.discardTop.value === 5) { room.pendingPenalty = 3; room.penaltyType = 'three'; }
+        else if (deal.discardTop.value === 8) room.turnIndex = (room.turnIndex + 2) % playerCount;
+        else if (deal.discardTop.value === 14) room.players.forEach((player) => { if (player.uid !== room.players[room.turnIndex].uid) drawFromMarket(room, player.uid, 1); });
+        const payload = { roomId: room.roomId, players: publicRoom(room).players, settings: room.settings,
+            startingPlayerIndex: room.turnIndex, startingPlayerUid: room.players[room.turnIndex].uid, startsFirst: room.players[room.turnIndex].uid === socket.playerData?.uid,
+            discardTop: deal.discardTop, marketCount: deal.marketCount };
+        io.to(room.roomId).emit('game_started', payload);
+        room.players.forEach((player) => io.to(player.socketId).emit('initial_hand', { roomId: room.roomId, hand: deal.handsByUid[player.uid] }));
+        broadcastGameState(room);
+        broadcastRoom(room);
+    });
+
+    socket.on('leave_room', (data) => {
+        const room = data && activeGames[data.roomId];
+        if (!room) return;
+        const leaving = room.players.find((player) => player.socketId === socket.id);
+        if (!leaving) return;
+        room.players = room.players.filter((player) => player.socketId !== socket.id);
+        socket.leave(room.roomId);
+        socket.data.roomId = null;
+        if (!room.players.length) delete activeGames[room.roomId];
+        else {
+            if (leaving.uid === room.hostUid) {
+                room.hostUid = room.players[0].uid;
+                room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
+            }
+            if (room.state === 'waiting') Object.assign(room.settings, suggestSettings(room.players.length));
+            broadcastRoom(room);
+        }
+    });
+
     // Join matchmaking
     socket.on('join_queue', async (playerData, callback) => {
         try {
@@ -224,7 +440,8 @@ io.on('connection', (socket) => {
                 photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : null;
             }
 
-            socket.playerData = { uid, name, email, photoURL };
+            const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+            socket.playerData = { uid, name, email, photoURL, isAdmin };
 
             if (queue.length > 0) {
                 const opponent = queue.shift();
@@ -247,17 +464,35 @@ io.on('connection', (socket) => {
 
                 activeGames[roomId] = {
                     roomId,
+                    hostUid: roomPlayers[0].uid,
                     players: roomPlayers,
                     state: 'playing',
+                    settings: { ...DEFAULT_SETTINGS },
                     turnIndex: 0,
                     createdAt: new Date().toLocaleTimeString(),
                 };
 
+                const quickRoom = activeGames[roomId];
+                const startingPlayerIndex = Math.floor(Math.random() * roomPlayers.length);
+                quickRoom.turnIndex = startingPlayerIndex;
+                const deal = createDeal(quickRoom);
+                if (deal.discardTop.value === 2) { quickRoom.pendingPenalty = 2; quickRoom.penaltyType = 'two'; }
+                else if (deal.discardTop.value === 5) { quickRoom.pendingPenalty = 3; quickRoom.penaltyType = 'three'; }
+                else if (deal.discardTop.value === 8) quickRoom.turnIndex = (quickRoom.turnIndex + 2) % roomPlayers.length;
+                else if (deal.discardTop.value === 14) roomPlayers.forEach((player) => { if (player.uid !== roomPlayers[quickRoom.turnIndex].uid) drawFromMarket(quickRoom, player.uid, 1); });
+
                 io.to(roomId).emit('match_found', {
                     roomId,
-                    players: roomPlayers,
-                    startingPlayerIndex: 0,
+                    players: roomPlayers.map(({ uid, name, photoURL, isHost, isAdmin }) => ({ uid, name, photoURL, isHost, isAdmin })),
+                    startingPlayerIndex: quickRoom.turnIndex,
+                    startingPlayerUid: roomPlayers[quickRoom.turnIndex].uid,
+                    startsFirst: roomPlayers[quickRoom.turnIndex].uid === socket.playerData.uid,
+                    settings: quickRoom.settings,
+                    discardTop: deal.discardTop,
+                    marketCount: deal.marketCount,
                 });
+                roomPlayers.forEach((player) => io.to(player.socketId).emit('initial_hand', { roomId, hand: deal.handsByUid[player.uid] }));
+                broadcastGameState(quickRoom);
 
                 log('🎮', `Match created: ${roomId} (${roomPlayers.map((p) => p.name).join(' vs ')})`);
                 if (typeof callback === 'function') callback({ success: true, roomId });
@@ -292,40 +527,86 @@ io.on('connection', (socket) => {
         return game.players.some((p) => p.socketId === socket.id);
     }
 
+    function activeGameForTurn(data) {
+        if (!validateRoomAction(data)) return null;
+        const game = activeGames[data.roomId];
+        const actor = game.players.find((player) => player.socketId === socket.id);
+        if (!actor || game.state !== 'playing' || game.status !== 'playing' || game.players[game.turnIndex]?.uid !== actor.uid) return null;
+        return { game, actor };
+    }
+
     socket.on('play_card', (data) => {
         try {
-            if (!validateRoomAction(data)) {
-                socket.emit('action_error', { error: 'Invalid room or you are not in this game.' });
-                return;
+            const turn = activeGameForTurn(data);
+            if (!turn) { socket.emit('game_action_error', { error: 'It is not your turn or this game is no longer active.' }); return; }
+            const { game, actor } = turn;
+            const hand = game.handsByUid[actor.uid] || [];
+            const cardIndex = hand.findIndex((card) => card.id === data.cardId);
+            if (cardIndex < 0) { socket.emit('game_action_error', { error: 'That card is not in your hand.' }); return; }
+            const card = hand[cardIndex];
+            const topCard = game.discardPile[game.discardPile.length - 1];
+            const requestedShape = data.requestedShape;
+            const validShapes = ['circles', 'triangles', 'crosses', 'squares', 'stars'];
+            const wild = card.isWild || card.value === 20;
+            if (wild && !validShapes.includes(requestedShape)) { socket.emit('game_action_error', { error: 'Choose a shape when playing Whot.' }); return; }
+            if (wild && (game.announcedShape?.uid !== actor.uid || game.announcedShape?.shape !== requestedShape)) { socket.emit('game_action_error', { error: 'Call a shape before playing Whot.' }); return; }
+            const legal = game.pendingPenalty > 0
+                ? (game.penaltyType === 'two' ? card.value === 2 : card.value === 5)
+                : wild || (game.activeSuit ? card.suit === game.activeSuit || card.value === topCard.value : card.suit === topCard.suit || card.value === topCard.value);
+            if (!legal) { socket.emit('game_action_error', { error: 'That card cannot be played on the current discard.' }); return; }
+
+            hand.splice(cardIndex, 1);
+            game.discardPile.push(card);
+            game.playedCount += 1;
+            game.activeSuit = wild ? requestedShape : null;
+            const totalPlayers = game.players.length;
+            const next = (game.turnIndex + 1) % totalPlayers;
+            if (card.value === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
+            else if (card.value === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
+            else if (card.value === 1) { game.turnIndex = game.turnIndex; }
+            else if (card.value === 8) { game.turnIndex = (game.turnIndex + 2) % totalPlayers; }
+            else if (card.value === 14) {
+                game.players.forEach((player) => { if (player.uid !== actor.uid) drawFromMarket(game, player.uid, 1); });
+                game.turnIndex = next;
+            } else game.turnIndex = next;
+
+            game.announcedShape = null;
+            io.to(data.roomId).emit('opponent_played_card', { roomId: data.roomId, playerId: actor.uid, card, requestedShape });
+            if (hand.length === 0) {
+                game.status = 'ended';
+                game.state = 'ended';
+                game.winnerUid = actor.uid;
+                io.to(data.roomId).emit('game_ended', { roomId: data.roomId, winnerUid: actor.uid });
             }
-            socket.to(data.roomId).emit('opponent_played_card', data);
-        } catch (err) {
-            log('💥', `play_card error: ${err.message}`);
-        }
+            broadcastGameState(game);
+        } catch (err) { log('💥', `play_card error: ${err.message}`); }
     });
 
     socket.on('draw_card', (data) => {
         try {
-            if (!validateRoomAction(data)) {
-                socket.emit('action_error', { error: 'Invalid room or you are not in this game.' });
-                return;
-            }
-            socket.to(data.roomId).emit('opponent_drew_card', data);
-        } catch (err) {
-            log('💥', `draw_card error: ${err.message}`);
-        }
+            const turn = activeGameForTurn(data);
+            if (!turn) { socket.emit('game_action_error', { error: 'It is not your turn or this game is no longer active.' }); return; }
+            const { game, actor } = turn;
+            const count = game.pendingPenalty > 0 ? game.pendingPenalty : 1;
+            drawFromMarket(game, actor.uid, count);
+            game.pendingPenalty = 0;
+            game.penaltyType = null;
+            game.turnIndex = (game.turnIndex + 1) % game.players.length;
+            io.to(data.roomId).emit('opponent_drew_card', { roomId: data.roomId, playerId: actor.uid, count });
+            broadcastGameState(game);
+        } catch (err) { log('💥', `draw_card error: ${err.message}`); }
     });
 
     socket.on('call_whot', (data) => {
-        try {
-            if (!validateRoomAction(data) || !isNonEmptyString(data.newShape, 20)) {
-                socket.emit('action_error', { error: 'Invalid Whot call.' });
-                return;
-            }
-            socket.to(data.roomId).emit('opponent_called_whot', data);
-        } catch (err) {
-            log('💥', `call_whot error: ${err.message}`);
+        const turn = activeGameForTurn(data);
+        const shape = data.namedSuit || data.newShape;
+        const whotInHand = turn && (turn.game.handsByUid[turn.actor.uid] || []).some((card) => card.id === data.cardId && card.value === 20);
+        if (!turn || !whotInHand || !['circles', 'triangles', 'crosses', 'squares', 'stars'].includes(shape)) {
+            socket.emit('game_action_error', { error: 'Invalid Whot shape call.' });
+            return;
         }
+        turn.game.announcedShape = { uid: turn.actor.uid, shape };
+        socket.to(data.roomId).emit('opponent_called_whot', { roomId: data.roomId, playerId: turn.actor.uid, namedSuit: shape });
     });
 
     socket.on('voice_offer', (data) => {
@@ -334,6 +615,14 @@ io.on('connection', (socket) => {
             return;
         }
         socket.to(data.roomId).emit('voice_offer', { roomId: data.roomId, sdp: data.sdp });
+    });
+
+    socket.on('voice_ready', (data) => {
+        if (!validateRoomAction(data)) {
+            socket.emit('action_error', { error: 'Invalid voice readiness signal or room membership.' });
+            return;
+        }
+        socket.to(data.roomId).emit('voice_ready', { roomId: data.roomId });
     });
 
     socket.on('voice_answer', (data) => {
@@ -463,6 +752,19 @@ io.on('connection', (socket) => {
             for (const [roomId, game] of Object.entries(activeGames)) {
                 const player = game.players.find((p) => p.socketId === socket.id);
                 if (player) {
+                    if (game.state === 'waiting') {
+                        game.players = game.players.filter((entry) => entry.socketId !== socket.id);
+                        if (!game.players.length) delete activeGames[roomId];
+                        else {
+                            if (player.uid === game.hostUid) {
+                                game.hostUid = game.players[0].uid;
+                                game.players.forEach((entry) => { entry.isHost = entry.uid === game.hostUid; });
+                            }
+                            Object.assign(game.settings, suggestSettings(game.players.length));
+                            broadcastRoom(game);
+                        }
+                        break;
+                    }
                     socket.to(roomId).emit('opponent_disconnected', {
                         message: `${player.name} disconnected.`,
                         roomId,
@@ -482,11 +784,17 @@ io.on('connection', (socket) => {
     socket.onAny((event) => {
         const knownEvents = [
             'join_queue',
+            'create_room',
+            'join_room',
+            'leave_room',
+            'update_room_settings',
+            'start_game',
             'leave_queue',
             'play_card',
             'draw_card',
             'call_whot',
             'voice_offer',
+            'voice_ready',
             'voice_answer',
             'ice_candidate',
             'game_over',
