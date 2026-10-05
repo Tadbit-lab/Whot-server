@@ -113,7 +113,7 @@ function buildDeckPool(deckCount) {
             }));
         }
         for (let index = 0; index < 5; index += 1) deck.push({
-            id: `${copy}-whot-${index}`, suit: 'whot', value: 20, label: ACTION_LABELS[20], isAction: false, isWild: true,
+            id: `${copy}-whot-${index}`, suit: 'whot', value: 20, label: ACTION_LABELS[20], isAction: true, isWild: true,
         });
     }
     return deck;
@@ -138,19 +138,18 @@ function createDeal(room) {
     room.activeSuit = null;
     room.pendingPenalty = 0;
     room.penaltyType = null;
+    room.hasDrawnThisTurn = false;
     room.playedCount = 0;
     room.status = 'playing';
     return { handsByUid, discardTop, marketCount: deck.length };
 }
 function publicRoom(room) {
-    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin }) => ({ uid, name, photoURL, isHost, isAdmin })),
+    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin, calledLastCard }) => ({ uid, name, photoURL, isHost, isAdmin, calledLastCard: Boolean(calledLastCard) })),
         state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
 }
 function broadcastRoom(room) { io.to(room.roomId).emit('room_updated', publicRoom(room)); }
 function suggestSettings(playerCount) {
-    if (playerCount >= 5) return { startingHandSize: 4, decks: 2 };
-    if (playerCount >= 3) return { startingHandSize: 5, decks: 1 };
-    return { startingHandSize: 6, decks: 1 };
+    return { decks: playerCount >= 4 ? 2 : 1 };
 }
 function gameSnapshot(room) {
     return {
@@ -160,9 +159,11 @@ function gameSnapshot(room) {
         currentTurnUid: room.players[room.turnIndex]?.uid || '',
         currentTurnIndex: room.turnIndex,
         discardTop: room.discardPile[room.discardPile.length - 1],
+        discardPile: room.discardPile,
         activeSuit: room.activeSuit,
         pendingPenalty: room.pendingPenalty,
         penaltyType: room.penaltyType,
+        hasDrawnThisTurn: Boolean(room.hasDrawnThisTurn),
         marketCount: room.market.length,
         status: room.status || room.state,
         winnerUid: room.winnerUid,
@@ -311,7 +312,6 @@ io.on('connection', (socket) => {
             if (!room || room.state !== 'waiting') throw new Error('Room not found or game already started.');
             if (room.players.length >= room.settings.maxPlayers) throw new Error('Room is full (6 players maximum).');
             if (room.players.some((existing) => existing.uid === player.uid)) throw new Error('You are already in this room.');
-            Object.assign(room.settings, suggestSettings(room.players.length + 1));
             room.players.push(player);
             socket.join(roomId);
             socket.data.roomId = roomId;
@@ -348,7 +348,7 @@ io.on('connection', (socket) => {
         const playerCount = room.players.length;
         const neededCards = playerCount * room.settings.startingHandSize + 1;
         const deckSize = 54 * room.settings.decks;
-        if (playerCount < 2 || playerCount > 6 || neededCards >= deckSize || (playerCount >= 5 && room.settings.startingHandSize >= 7 && room.settings.decks < 2)) {
+        if (playerCount < 2 || playerCount > 6 || neededCards >= deckSize) {
             socket.emit('action_error', { error: 'Not enough cards for this setup. Choose fewer cards or 2 decks.' });
             return;
         }
@@ -383,7 +383,6 @@ io.on('connection', (socket) => {
                 room.hostUid = room.players[0].uid;
                 room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
             }
-            if (room.state === 'waiting') Object.assign(room.settings, suggestSettings(room.players.length));
             broadcastRoom(room);
         }
     });
@@ -466,35 +465,16 @@ io.on('connection', (socket) => {
                     roomId,
                     hostUid: roomPlayers[0].uid,
                     players: roomPlayers,
-                    state: 'playing',
-                    settings: { ...DEFAULT_SETTINGS },
+                    state: 'waiting',
+                    settings: { ...DEFAULT_SETTINGS, ...suggestSettings(roomPlayers.length) },
                     turnIndex: 0,
                     createdAt: new Date().toLocaleTimeString(),
                 };
+                socket.data.roomId = roomId;
+                opponent.socket.data.roomId = roomId;
+                broadcastRoom(activeGames[roomId]);
 
-                const quickRoom = activeGames[roomId];
-                const startingPlayerIndex = Math.floor(Math.random() * roomPlayers.length);
-                quickRoom.turnIndex = startingPlayerIndex;
-                const deal = createDeal(quickRoom);
-                if (deal.discardTop.value === 2) { quickRoom.pendingPenalty = 2; quickRoom.penaltyType = 'two'; }
-                else if (deal.discardTop.value === 5) { quickRoom.pendingPenalty = 3; quickRoom.penaltyType = 'three'; }
-                else if (deal.discardTop.value === 8) quickRoom.turnIndex = (quickRoom.turnIndex + 2) % roomPlayers.length;
-                else if (deal.discardTop.value === 14) roomPlayers.forEach((player) => { if (player.uid !== roomPlayers[quickRoom.turnIndex].uid) drawFromMarket(quickRoom, player.uid, 1); });
-
-                io.to(roomId).emit('match_found', {
-                    roomId,
-                    players: roomPlayers.map(({ uid, name, photoURL, isHost, isAdmin }) => ({ uid, name, photoURL, isHost, isAdmin })),
-                    startingPlayerIndex: quickRoom.turnIndex,
-                    startingPlayerUid: roomPlayers[quickRoom.turnIndex].uid,
-                    startsFirst: roomPlayers[quickRoom.turnIndex].uid === socket.playerData.uid,
-                    settings: quickRoom.settings,
-                    discardTop: deal.discardTop,
-                    marketCount: deal.marketCount,
-                });
-                roomPlayers.forEach((player) => io.to(player.socketId).emit('initial_hand', { roomId, hand: deal.handsByUid[player.uid] }));
-                broadcastGameState(quickRoom);
-
-                log('🎮', `Match created: ${roomId} (${roomPlayers.map((p) => p.name).join(' vs ')})`);
+                log('🎮', `Waiting room created: ${roomId} (${roomPlayers.map((p) => p.name).join(' vs ')})`);
                 if (typeof callback === 'function') callback({ success: true, roomId });
             } else {
                 queue.push({ socket, playerData: socket.playerData });
@@ -555,27 +535,38 @@ io.on('connection', (socket) => {
                 : wild || (game.activeSuit ? card.suit === game.activeSuit || card.value === topCard.value : card.suit === topCard.suit || card.value === topCard.value);
             if (!legal) { socket.emit('game_action_error', { error: 'That card cannot be played on the current discard.' }); return; }
 
+            if (hand.length === 2 && !actor.calledLastCard) drawFromMarket(game, actor.uid, 1);
             hand.splice(cardIndex, 1);
+            actor.calledLastCard = false;
             game.discardPile.push(card);
             game.playedCount += 1;
-            game.activeSuit = wild ? requestedShape : null;
+            if (wild) game.activeSuit = requestedShape;
+            game.hasDrawnThisTurn = false;
             const totalPlayers = game.players.length;
-            const next = (game.turnIndex + 1) % totalPlayers;
-            if (card.value === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
-            else if (card.value === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
-            else if (card.value === 1) { game.turnIndex = game.turnIndex; }
-            else if (card.value === 8) { game.turnIndex = (game.turnIndex + 2) % totalPlayers; }
-            else if (card.value === 14) {
-                game.players.forEach((player) => { if (player.uid !== actor.uid) drawFromMarket(game, player.uid, 1); });
-                game.turnIndex = next;
-            } else game.turnIndex = next;
-
-            game.announcedShape = null;
-            io.to(data.roomId).emit('opponent_played_card', { roomId: data.roomId, playerId: actor.uid, card, requestedShape });
             if (hand.length === 0) {
                 game.status = 'ended';
                 game.state = 'ended';
                 game.winnerUid = actor.uid;
+            } else {
+                const next = (game.turnIndex + 1) % totalPlayers;
+                if (card.value === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
+                else if (card.value === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
+                else if (card.value === 1) { game.turnIndex = game.turnIndex; }
+                else if (card.value === 8) { game.turnIndex = (game.turnIndex + (card.suit === 'stars' ? 3 : 2)) % totalPlayers; }
+                else if (card.value === 14) {
+                    game.players.forEach((player) => { if (player.uid !== actor.uid) drawFromMarket(game, player.uid, 1); });
+                    game.turnIndex = next;
+                } else if (wild) {
+                    game.turnIndex = next;
+                } else {
+                    game.activeSuit = null;
+                    game.turnIndex = next;
+                }
+            }
+
+            game.announcedShape = null;
+            socket.to(data.roomId).emit('opponent_played_card', { roomId: data.roomId, playerId: actor.uid, card, requestedShape });
+            if (hand.length === 0) {
                 io.to(data.roomId).emit('game_ended', { roomId: data.roomId, winnerUid: actor.uid });
             }
             broadcastGameState(game);
@@ -587,14 +578,47 @@ io.on('connection', (socket) => {
             const turn = activeGameForTurn(data);
             if (!turn) { socket.emit('game_action_error', { error: 'It is not your turn or this game is no longer active.' }); return; }
             const { game, actor } = turn;
+            if (game.hasDrawnThisTurn && game.pendingPenalty === 0) {
+                socket.emit('game_action_error', { error: 'You already drew a card. Play a card or pass your turn.' });
+                return;
+            }
             const count = game.pendingPenalty > 0 ? game.pendingPenalty : 1;
             drawFromMarket(game, actor.uid, count);
-            game.pendingPenalty = 0;
-            game.penaltyType = null;
-            game.turnIndex = (game.turnIndex + 1) % game.players.length;
-            io.to(data.roomId).emit('opponent_drew_card', { roomId: data.roomId, playerId: actor.uid, count });
+            actor.calledLastCard = false;
+            if (game.pendingPenalty > 0) {
+                game.pendingPenalty = 0;
+                game.penaltyType = null;
+                game.hasDrawnThisTurn = false;
+                game.turnIndex = (game.turnIndex + 1) % game.players.length;
+            } else {
+                game.hasDrawnThisTurn = true;
+            }
+            socket.to(data.roomId).emit('opponent_drew_card', { roomId: data.roomId, playerId: actor.uid, count });
             broadcastGameState(game);
         } catch (err) { log('💥', `draw_card error: ${err.message}`); }
+    });
+
+    socket.on('pass_turn', (data) => {
+        const turn = activeGameForTurn(data);
+        if (!turn) { socket.emit('game_action_error', { error: 'It is not your turn or this game is no longer active.' }); return; }
+        const { game } = turn;
+        if (!game.hasDrawnThisTurn || game.pendingPenalty > 0) {
+            socket.emit('game_action_error', { error: 'Draw a card before passing.' });
+            return;
+        }
+        game.hasDrawnThisTurn = false;
+        game.turnIndex = (game.turnIndex + 1) % game.players.length;
+        broadcastGameState(game);
+    });
+
+    socket.on('call_last_card', (data) => {
+        const turn = activeGameForTurn(data);
+        if (!turn || (turn.game.handsByUid[turn.actor.uid] || []).length !== 2) {
+            socket.emit('game_action_error', { error: 'Call Last Card when you have exactly two cards.' });
+            return;
+        }
+        turn.actor.calledLastCard = !turn.actor.calledLastCard;
+        broadcastGameState(turn.game);
     });
 
     socket.on('call_whot', (data) => {
@@ -792,6 +816,8 @@ io.on('connection', (socket) => {
             'leave_queue',
             'play_card',
             'draw_card',
+            'pass_turn',
+            'call_last_card',
             'call_whot',
             'voice_offer',
             'voice_ready',
