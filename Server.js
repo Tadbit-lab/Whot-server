@@ -146,11 +146,22 @@ function createDeal(room) {
     room.status = 'playing';
     return { handsByUid, discardTop, marketCount: deck.length };
 }
+function syncHostState(room) {
+    if (!room || !Array.isArray(room.players) || room.players.length === 0) return null;
+    const nextHost = room.players.find((player) => player.uid === room.hostUid) || room.players[0];
+    room.hostUid = nextHost ? nextHost.uid : room.hostUid;
+    room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
+    return nextHost;
+}
 function publicRoom(room) {
+    syncHostState(room);
     return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin, calledLastCard }) => ({ uid, name, photoURL, isHost, isAdmin, calledLastCard: Boolean(calledLastCard) })),
         state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
 }
-function broadcastRoom(room) { io.to(room.roomId).emit('room_updated', publicRoom(room)); }
+function broadcastRoom(room) {
+    syncHostState(room);
+    io.to(room.roomId).emit('room_updated', publicRoom(room));
+}
 function suggestSettings(playerCount) {
     return { decks: playerCount >= 4 ? 2 : 1 };
 }
@@ -297,6 +308,7 @@ io.on('connection', (socket) => {
             player.isHost = true;
             const room = activeGames[roomId] = { roomId, hostUid: player.uid, players: [player], state: 'waiting',
                 settings: { ...DEFAULT_SETTINGS }, turnIndex: 0, createdAt: new Date().toISOString() };
+            room.players.forEach((entry) => { entry.isHost = entry.uid === room.hostUid; });
             socket.join(roomId);
             socket.data.roomId = roomId;
             broadcastRoom(room);
@@ -316,6 +328,7 @@ io.on('connection', (socket) => {
             if (room.players.length >= room.settings.maxPlayers) throw new Error('Room is full (6 players maximum).');
             if (room.players.some((existing) => existing.uid === player.uid)) throw new Error('You are already in this room.');
             room.players.push(player);
+            syncHostState(room);
             socket.join(roomId);
             socket.data.roomId = roomId;
             broadcastRoom(room);
@@ -375,19 +388,23 @@ io.on('connection', (socket) => {
     socket.on('leave_room', (data) => {
         const room = data && activeGames[data.roomId];
         if (!room) return;
-        const leaving = room.players.find((player) => player.socketId === socket.id);
+        const leaving = room.players.find((player) => player.socketId === socket.id || player.uid === socket.playerData?.uid);
         if (!leaving) return;
-        room.players = room.players.filter((player) => player.socketId !== socket.id);
+        const hostChanged = leaving.uid === room.hostUid;
+        room.players = room.players.filter((player) => player.socketId !== socket.id && player.uid !== leaving.uid);
         socket.leave(room.roomId);
         socket.data.roomId = null;
-        if (!room.players.length) delete activeGames[room.roomId];
-        else {
-            if (leaving.uid === room.hostUid) {
-                room.hostUid = room.players[0].uid;
-                room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
-            }
-            broadcastRoom(room);
+        if (!room.players.length) {
+            delete activeGames[room.roomId];
+            return;
         }
+        if (hostChanged) {
+            room.hostUid = room.players[0].uid;
+            room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
+            io.to(room.roomId).emit('host_changed', { roomId: room.roomId, newHostUid: room.hostUid, newHostName: room.players[0].name, hostUid: room.hostUid });
+        }
+        syncHostState(room);
+        broadcastRoom(room);
     });
 
     // Join matchmaking
@@ -789,29 +806,54 @@ io.on('connection', (socket) => {
             }
 
             for (const [roomId, game] of Object.entries(activeGames)) {
-                const player = game.players.find((p) => p.socketId === socket.id);
-                if (player) {
-                    if (game.state === 'waiting') {
-                        game.players = game.players.filter((entry) => entry.socketId !== socket.id);
-                        if (!game.players.length) delete activeGames[roomId];
-                        else {
-                            if (player.uid === game.hostUid) {
-                                game.hostUid = game.players[0].uid;
-                                game.players.forEach((entry) => { entry.isHost = entry.uid === game.hostUid; });
-                            }
-                            Object.assign(game.settings, suggestSettings(game.players.length));
-                            broadcastRoom(game);
-                        }
-                        break;
-                    }
-                    socket.to(roomId).emit('opponent_disconnected', {
-                        message: `${player.name} disconnected.`,
-                        roomId,
-                    });
+                const player = game.players.find((p) => p.socketId === socket.id || p.uid === socket.playerData?.uid);
+                if (!player) continue;
+
+                game.players = game.players.filter((entry) => entry.socketId !== socket.id && entry.uid !== player.uid);
+
+                if (!game.players.length) {
                     delete activeGames[roomId];
-                    log('❌', `Room ${roomId} closed (${player.name} disconnected: ${reason}).`);
+                    log('❌', `Room ${roomId} closed after last player disconnected (${reason}).`);
                     break;
                 }
+
+                if (game.state === 'playing' && game.players.length === 1) {
+                    game.state = 'ended';
+                    game.status = 'ended';
+                    game.winnerUid = game.players[0].uid;
+                    io.to(roomId).emit('game_ended', { roomId, winnerUid: game.players[0].uid });
+                    broadcastRoom(game);
+                    delete activeGames[roomId];
+                    break;
+                }
+
+                const hostChanged = player.uid === game.hostUid;
+                if (hostChanged) {
+                    game.hostUid = game.players[0].uid;
+                    game.players.forEach((entry) => { entry.isHost = entry.uid === game.hostUid; });
+                    io.to(roomId).emit('host_changed', {
+                        roomId,
+                        newHostUid: game.hostUid,
+                        newHostName: game.players[0].name,
+                        hostUid: game.hostUid,
+                    });
+                }
+
+                if (game.state === 'waiting') {
+                    Object.assign(game.settings, suggestSettings(game.players.length));
+                    broadcastRoom(game);
+                } else if (game.state === 'playing') {
+                    io.to(roomId).emit('opponent_disconnected', {
+                        message: `${player.name} disconnected.`,
+                        roomId,
+                        uid: player.uid,
+                    });
+                    broadcastGameState(game);
+                    broadcastRoom(game);
+                }
+
+                log('🔴', `Player disconnected from room ${roomId}: ${player.name} (${reason})`);
+                break;
             }
 
             log('🔴', `Player disconnected: ${socket.id} (${reason})`);
