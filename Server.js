@@ -102,6 +102,9 @@ const CARD_RANKS = {
     stars: [1, 2, 3, 4, 5, 7, 8],
 };
 const ACTION_LABELS = { 1: 'HOLD ON', 2: 'PICK TWO', 5: 'PICK THREE', 8: 'SUSPENSION', 14: 'GENERAL MARKET', 20: 'WHOT' };
+function cardNumber(card) { return Number(card?.value ?? card?.number); }
+function cardShape(card) { return String(card?.suit ?? card?.shape ?? '').toLowerCase(); }
+function isWildCard(card) { return card?.isWild === true || cardNumber(card) === 20; }
 function buildDeckPool(deckCount) {
     const deck = [];
     for (let copy = 0; copy < deckCount; copy += 1) {
@@ -525,14 +528,19 @@ io.on('connection', (socket) => {
             if (cardIndex < 0) { socket.emit('game_action_error', { error: 'That card is not in your hand.' }); return; }
             const card = hand[cardIndex];
             const topCard = game.discardPile[game.discardPile.length - 1];
-            const requestedShape = data.requestedShape;
+            const requestedShape = String(data.requestedShape ?? data.namedSuit ?? '').toLowerCase();
             const validShapes = ['circles', 'triangles', 'crosses', 'squares', 'stars'];
-            const wild = card.isWild || card.value === 20;
+            const wild = isWildCard(card);
             if (wild && !validShapes.includes(requestedShape)) { socket.emit('game_action_error', { error: 'Choose a shape when playing Whot.' }); return; }
-            if (wild && (game.announcedShape?.uid !== actor.uid || game.announcedShape?.shape !== requestedShape)) { socket.emit('game_action_error', { error: 'Call a shape before playing Whot.' }); return; }
+            if (wild && (game.announcedShape?.uid !== actor.uid || String(game.announcedShape?.shape ?? '').toLowerCase() !== requestedShape)) { socket.emit('game_action_error', { error: 'Call a shape before playing Whot.' }); return; }
+            const cardValue = cardNumber(card);
+            const topValue = cardNumber(topCard);
+            const cardSuit = cardShape(card);
+            const topSuit = cardShape(topCard);
+            const activeShape = game.activeSuit ? String(game.activeSuit).toLowerCase() : null;
             const legal = game.pendingPenalty > 0
-                ? (game.penaltyType === 'two' ? card.value === 2 : card.value === 5)
-                : wild || (game.activeSuit ? card.suit === game.activeSuit || card.value === topCard.value : card.suit === topCard.suit || card.value === topCard.value);
+                ? wild || (game.penaltyType === 'two' ? cardValue === 2 : cardValue === 5)
+                : wild || (activeShape ? cardSuit === activeShape || cardValue === topValue : cardSuit === topSuit || cardValue === topValue);
             if (!legal) { socket.emit('game_action_error', { error: 'That card cannot be played on the current discard.' }); return; }
 
             if (hand.length === 2 && !actor.calledLastCard) drawFromMarket(game, actor.uid, 1);
@@ -549,11 +557,11 @@ io.on('connection', (socket) => {
                 game.winnerUid = actor.uid;
             } else {
                 const next = (game.turnIndex + 1) % totalPlayers;
-                if (card.value === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
-                else if (card.value === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
-                else if (card.value === 1) { game.turnIndex = game.turnIndex; }
-                else if (card.value === 8) { game.turnIndex = (game.turnIndex + (card.suit === 'stars' ? 3 : 2)) % totalPlayers; }
-                else if (card.value === 14) {
+                if (cardValue === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
+                else if (cardValue === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
+                else if (cardValue === 1) { game.turnIndex = game.turnIndex; }
+                else if (cardValue === 8) { game.turnIndex = (game.turnIndex + (cardSuit === 'stars' ? 3 : 2)) % totalPlayers; }
+                else if (cardValue === 14) {
                     game.players.forEach((player) => { if (player.uid !== actor.uid) drawFromMarket(game, player.uid, 1); });
                     game.turnIndex = next;
                 } else if (wild) {
@@ -565,7 +573,14 @@ io.on('connection', (socket) => {
             }
 
             game.announcedShape = null;
-            socket.to(data.roomId).emit('opponent_played_card', { roomId: data.roomId, playerId: actor.uid, card, requestedShape });
+            socket.to(data.roomId).emit('opponent_played_card', {
+                roomId: data.roomId,
+                playerId: actor.uid,
+                senderUid: actor.uid,
+                card,
+                requestedShape: wild ? requestedShape : null,
+                nextTurnIndex: game.turnIndex,
+            });
             if (hand.length === 0) {
                 io.to(data.roomId).emit('game_ended', { roomId: data.roomId, winnerUid: actor.uid });
             }
