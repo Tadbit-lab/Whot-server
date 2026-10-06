@@ -75,12 +75,17 @@ const latestNotices = [];
 const activeConnections = new Map();
 const recentConnections = [];
 const ghostSpectators = new Map();
+const adminSocketSessions = new Map();
+const trafficSimulations = new Map();
+const telemetryHistory = [];
+const gameplayActionTimes = [];
 const metrics = {
     gamesStarted: 0,
     gamesCompleted: 0,
     forfeits: 0,
     actionErrors: 0,
     voiceEventsRelayed: 0,
+    cardsPlayed: 0,
     lastGameAt: null,
 };
 let matchmakingPaused = false;
@@ -92,6 +97,7 @@ let featureFlags = {
     maxPlayers: MAX_PLAYERS_PER_ROOM,
     minStartingCards: 4,
     maxStartingCards: 8,
+    autoFillQueueWithBots: false,
 };
 
 // ─── Helpers ───
@@ -286,6 +292,85 @@ function broadcastGhostSnapshots(game) {
     for (const socketId of spectators) io.to(socketId).emit('admin_ghost_snapshot', snapshot);
 }
 
+async function authenticateAdminSocket(socket, token) {
+    const admin = await requireAdminToken(token);
+    adminSocketSessions.set(socket.id, {
+        uid: admin.uid,
+        email: admin.email,
+        expiresAt: Date.now() + 5 * 60_000,
+    });
+    return admin;
+}
+
+function emitAdminPacket(packet) {
+    for (const [socketId, session] of adminSocketSessions) {
+        if (session.expiresAt <= Date.now() || !io.sockets.sockets.has(socketId)) {
+            adminSocketSessions.delete(socketId);
+            continue;
+        }
+        io.to(socketId).emit('admin_packet_stream', packet);
+    }
+}
+
+function recordGameplayAction(socket, data, actionType, details = {}) {
+    const actor = socket.playerData || {};
+    const timestamp = Date.now();
+    if (actionType === 'PLAY_CARD') gameplayActionTimes.push(timestamp);
+    while (gameplayActionTimes.length && gameplayActionTimes[0] < timestamp - 60_000) gameplayActionTimes.shift();
+    const sentAt = Number(data?.clientSentAt);
+    const latencyMs = Number.isFinite(sentAt) && Math.abs(timestamp - sentAt) <= 60_000
+        ? Math.abs(timestamp - sentAt)
+        : null;
+    emitAdminPacket({
+        id: `${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date(timestamp).toISOString(),
+        actionType,
+        roomId: String(data?.roomId || ''),
+        actorUid: actor.uid || null,
+        actorName: actor.name || 'Unknown',
+        latencyMs,
+        ...details,
+    });
+}
+
+function telemetrySnapshot() {
+    const timestamp = Date.now();
+    for (const [id, simulation] of trafficSimulations) {
+        if (simulation.expiresAt <= timestamp) {
+            clearInterval(simulation.timer);
+            simulation.virtualSockets.forEach((mockSocket) => { mockSocket.connected = false; });
+            trafficSimulations.delete(id);
+        }
+    }
+    while (gameplayActionTimes.length && gameplayActionTimes[0] < timestamp - 60_000) gameplayActionTimes.shift();
+    const simulatedPlayers = [...trafficSimulations.values()].reduce((sum, session) =>
+        sum + session.virtualSockets.filter((mockSocket) => mockSocket.connected).length, 0);
+    const simulatedRooms = [...trafficSimulations.values()].reduce((sum, session) => sum + session.rooms, 0);
+    return {
+        timestamp,
+        concurrentPlayers: [...activeConnections.values()].filter((connection) => connection.uid).length + simulatedPlayers,
+        activeRooms: Object.keys(activeGames).length + simulatedRooms,
+        cardsPlayedPerMinute: gameplayActionTimes.filter((time) => time >= timestamp - 60_000 && time).length,
+        simulatedPlayers,
+    };
+}
+
+function sampleTelemetry() {
+    const sample = telemetrySnapshot();
+    telemetryHistory.push(sample);
+    const cutoff = sample.timestamp - 15 * 60_000;
+    while (telemetryHistory.length && telemetryHistory[0].timestamp < cutoff) telemetryHistory.shift();
+}
+
+setInterval(sampleTelemetry, 5000).unref?.();
+sampleTelemetry();
+setInterval(() => {
+    if (!featureFlags.autoFillQueueWithBots) return;
+    for (const entry of [...queue]) {
+        if (Date.now() - Date.parse(entry.joinedAt) >= 30_000) void startBotFilledMatch(entry);
+    }
+}, 1000).unref?.();
+
 function getServerStats() {
     return {
         activeRooms: Object.keys(activeGames).length,
@@ -307,6 +392,7 @@ function publicRoomSummary(game) {
             name: player.name,
             photoURL: player.photoURL || null,
             isHost: player.uid === game.hostUid,
+            isBot: Boolean(player.isBot),
         })),
         playerCount: game.players.length,
         settings: game.settings,
@@ -547,6 +633,7 @@ async function createReplayMatch(game) {
         uid: player.uid,
         name: player.name,
         ...(player.photoURL ? { photoURL: player.photoURL } : {}),
+        ...(player.isBot ? { isBot: true } : {}),
         seatIndex,
     }));
     game.matchPlayers = players;
@@ -763,7 +850,7 @@ async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'for
 
     if (!db || !FieldValue || game.ranked === false || (!winnerUid && resultType !== 'normal')) return;
     const players = [...new Map((game.matchPlayers || game.players)
-        .filter((player) => player.uid).map((player) => [player.uid, player])).values()];
+        .filter((player) => !player.isBot && player.uid).map((player) => [player.uid, player])).values()];
     const happyHourMultiplier = happyHourIsActive() ? happyHour.multiplier : 1;
     const userRefs = players.map((player) => db.collection('users').doc(player.uid));
     await db.runTransaction(async (transaction) => {
@@ -915,7 +1002,7 @@ function syncHostState(room) {
 }
 function publicRoom(room) {
     syncHostState(room);
-    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin, calledLastCard }) => ({ uid, name, photoURL, isHost, isAdmin, calledLastCard: Boolean(calledLastCard) })),
+    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin, isBot, calledLastCard }) => ({ uid, name, photoURL, isHost, isAdmin, isBot: Boolean(isBot), calledLastCard: Boolean(calledLastCard) })),
         state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
 }
 function broadcastRoom(room) {
@@ -947,8 +1034,11 @@ function gameSnapshot(room) {
 }
 function broadcastGameState(room) {
     io.to(room.roomId).emit('game_state', gameSnapshot(room));
-    room.players.forEach((player) => io.to(player.socketId).emit('hand_update', { roomId: room.roomId, hand: room.handsByUid[player.uid] || [] }));
+    room.players.forEach((player) => {
+        if (player.socketId) io.to(player.socketId).emit('hand_update', { roomId: room.roomId, hand: room.handsByUid[player.uid] || [] });
+    });
     broadcastGhostSnapshots(room);
+    scheduleBotTurn(room);
 }
 function recycleMarket(room) {
     if (room.market.length || room.discardPile.length <= 1) return;
@@ -965,6 +1055,175 @@ function drawFromMarket(room, uid, count = 1) {
         hand.push(card);
     }
     return hand;
+}
+
+function scheduleBotTurn(room) {
+    if (!room || room.state !== 'playing' || room.botTurnTimer || !room.players[room.turnIndex]?.isBot) return;
+    room.botTurnTimer = setTimeout(async () => {
+        room.botTurnTimer = null;
+        if (room.state !== 'playing') return;
+        const bot = room.players[room.turnIndex];
+        if (!bot?.isBot) return;
+        const hand = room.handsByUid[bot.uid] || [];
+        const topCard = room.discardPile[room.discardPile.length - 1];
+        const topValue = cardNumber(topCard);
+        const activeShape = room.activeSuit ? String(room.activeSuit).toLowerCase() : null;
+        const legalCards = hand.filter((card) => room.pendingPenalty > 0
+            ? isWildCard(card) || (room.penaltyType === 'two' ? cardNumber(card) === 2 : cardNumber(card) === 5)
+            : isWildCard(card) || (activeShape
+                ? cardShape(card) === activeShape || cardNumber(card) === topValue
+                : cardShape(card) === cardShape(topCard) || cardNumber(card) === topValue));
+        const actorIndex = room.turnIndex;
+        const analysisContext = captureReplayContext(room, bot.uid);
+        if (legalCards.length) {
+            legalCards.sort((left, right) => Number(isWildCard(left)) - Number(isWildCard(right))
+                || Number([2, 5].includes(cardNumber(right))) - Number([2, 5].includes(cardNumber(left))));
+            const card = legalCards[0];
+            if (hand.length === 2 && !bot.calledLastCard) drawFromMarket(room, bot.uid, 1);
+            hand.splice(hand.indexOf(card), 1);
+            room.discardPile.push(card);
+            room.playedCount += 1;
+            metrics.cardsPlayed += 1;
+            gameplayActionTimes.push(Date.now());
+            room.hasDrawnThisTurn = false;
+            const requestedShape = isWildCard(card)
+                ? Object.entries(hand.filter((held) => cardShape(held) !== 'whot')
+                    .reduce((counts, held) => ({ ...counts, [cardShape(held)]: (counts[cardShape(held)] || 0) + 1 }), {}))
+                    .sort((a, b) => b[1] - a[1])[0]?.[0] || 'circles'
+                : null;
+            if (requestedShape) room.activeSuit = requestedShape;
+            const next = (room.turnIndex + 1) % room.players.length;
+            const value = cardNumber(card);
+            if (hand.length === 0) {
+                room.state = 'ended';
+                room.status = 'ended';
+                room.winnerUid = bot.uid;
+            } else if (value === 2) {
+                room.pendingPenalty += 2;
+                room.penaltyType = 'two';
+                room.turnIndex = next;
+            } else if (value === 5) {
+                room.pendingPenalty += 3;
+                room.penaltyType = 'three';
+                room.turnIndex = next;
+            } else if (value === 1) {
+                room.turnIndex = room.turnIndex;
+            } else if (value === 8) {
+                room.turnIndex = (room.turnIndex + 2) % room.players.length;
+            } else if (value === 14) {
+                room.players.filter((player) => player.uid !== bot.uid).forEach((player) => drawFromMarket(room, player.uid, 1));
+                room.turnIndex = next;
+            } else {
+                if (!isWildCard(card)) room.activeSuit = null;
+                room.turnIndex = next;
+            }
+            void recordReplayTurn(room, {
+                actionType: isWildCard(card) ? 'whot' : 'play',
+                actorUid: bot.uid,
+                actorName: bot.name,
+                card,
+                requestedShape,
+                turnIndexBefore: actorIndex,
+                analysisContext,
+            });
+            emitAdminPacket({
+                id: `${Date.now()}-bot`,
+                timestamp: new Date().toISOString(),
+                actionType: 'PLAY_CARD',
+                roomId: room.roomId,
+                actorUid: bot.uid,
+                actorName: bot.name,
+                latencyMs: 0,
+                card: { label: card.label, value: card.value, suit: card.suit },
+            });
+            if (room.state === 'ended') io.to(room.roomId).emit('game_ended', { roomId: room.roomId, winnerUid: bot.uid });
+            else io.to(room.roomId).emit('opponent_played_card', {
+                roomId: room.roomId,
+                playerId: bot.uid,
+                senderUid: bot.uid,
+                card,
+                requestedShape,
+                nextTurnIndex: room.turnIndex,
+            });
+        } else {
+            const drawCount = room.pendingPenalty > 0 ? room.pendingPenalty : 1;
+            drawFromMarket(room, bot.uid, drawCount);
+            room.pendingPenalty = 0;
+            room.penaltyType = null;
+            room.hasDrawnThisTurn = false;
+            room.turnIndex = (room.turnIndex + 1) % room.players.length;
+            void recordReplayTurn(room, {
+                actionType: 'draw',
+                actorUid: bot.uid,
+                actorName: bot.name,
+                penaltyAmount: drawCount > 1 ? drawCount : null,
+                turnIndexBefore: actorIndex,
+                analysisContext,
+            });
+            io.to(room.roomId).emit('opponent_drew_card', { roomId: room.roomId, playerId: bot.uid, count: drawCount });
+        }
+        broadcastGameState(room);
+    }, 900);
+}
+
+async function startBotFilledMatch(entry) {
+    if (!featureFlags.autoFillQueueWithBots || !queue.includes(entry) || !entry.socket.connected) return;
+    const queueIndex = queue.indexOf(entry);
+    if (queueIndex < 0 || Date.now() - Date.parse(entry.joinedAt) < 30_000) return;
+    queue.splice(queueIndex, 1);
+    const botNames = ['Kofi', 'Amaka', 'Tunde'];
+    const bot = {
+        uid: `ai-bot-${crypto.randomBytes(6).toString('hex')}`,
+        name: botNames[Math.floor(Math.random() * botNames.length)],
+        socketId: null,
+        isHost: false,
+        isAdmin: false,
+        isBot: true,
+        ip: null,
+    };
+    const human = { socketId: entry.socket.id, ...entry.playerData, isHost: true, isBot: false };
+    const roomId = `WHOT-AI-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const room = activeGames[roomId] = {
+        roomId,
+        hostUid: human.uid,
+        players: [human, bot],
+        state: 'playing',
+        status: 'playing',
+        settings: { ...DEFAULT_SETTINGS, ...suggestSettings(2), maxPlayers: 2 },
+        turnIndex: 0,
+        createdAt: new Date().toISOString(),
+        ranked: featureFlags.rankedEnabled,
+        turnSerial: 0,
+        botFilled: true,
+    };
+    room.settings.startingHandSize = Math.max(featureFlags.minStartingCards, Math.min(6, featureFlags.maxStartingCards));
+    entry.socket.join(roomId);
+    entry.socket.data.roomId = roomId;
+    const deal = createDeal(room);
+    room.turnIndex = 0;
+    if (deal.discardTop.value === 2) { room.pendingPenalty = 2; room.penaltyType = 'two'; }
+    else if (deal.discardTop.value === 5) { room.pendingPenalty = 3; room.penaltyType = 'three'; }
+    else if (deal.discardTop.value === 14) drawFromMarket(room, bot.uid, 1);
+    metrics.gamesStarted += 1;
+    metrics.lastGameAt = new Date().toISOString();
+    try { await createReplayMatch(room); } catch (error) { log('⚠️', `Bot match replay initialization failed: ${error.message}`); }
+    const payload = {
+        roomId,
+        matchId: room.matchId || null,
+        players: publicRoom(room).players,
+        settings: room.settings,
+        startingPlayerIndex: room.turnIndex,
+        startingPlayerUid: human.uid,
+        startsFirst: true,
+        discardTop: deal.discardTop,
+        marketCount: deal.marketCount,
+        gameState: gameSnapshot(room),
+        botFilled: true,
+    };
+    entry.socket.emit('game_started', payload);
+    entry.socket.emit('initial_hand', { roomId, hand: deal.handsByUid[human.uid] || [] });
+    broadcastGameState(room);
+    log('🤖', `Auto-filled queue entry ${human.uid} with ${bot.name} in ${roomId}.`);
 }
 
 // ─── Self-Ping Keep-Alive (Prevents Render Sleeping) ───
@@ -1024,6 +1283,40 @@ app.get('/api/stats', (req, res) => {
 app.get('/api/admin/metrics', adminAuth, async (req, res, next) => {
     try {
         res.json(await adminMetrics());
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/admin/telemetry', adminAuth, (req, res) => {
+    const snapshot = telemetrySnapshot();
+    const history = [...telemetryHistory];
+    if (!history.length || history[history.length - 1].timestamp !== snapshot.timestamp) history.push(snapshot);
+    res.json({ current: snapshot, history: history.slice(-180) });
+});
+
+app.get('/api/admin/export', adminAuth, async (req, res, next) => {
+    try {
+        await auditAdminAction(req.admin, 'export_system_data', 'system');
+        let auditLogs = [];
+        if (db) {
+            const auditSnapshot = await db.collection('adminLogs').orderBy('timestamp', 'desc').limit(1000).get();
+            auditLogs = auditSnapshot.docs.map((entry) => ({ id: entry.id, ...entry.data() }));
+        }
+        const exportPayload = {
+            generatedAt: new Date().toISOString(),
+            rooms: Object.values(activeGames).map(publicRoomSummary),
+            queue: queue.map((entry) => ({
+                uid: entry.playerData.uid,
+                name: entry.playerData.name,
+                joinedAt: entry.joinedAt,
+            })),
+            auditLogs,
+            stats: await adminMetrics(),
+            telemetry: telemetrySnapshot(),
+        };
+        res.setHeader('Content-Disposition', 'attachment; filename="whot-system-backup.json"');
+        res.json(exportPayload);
     } catch (error) {
         next(error);
     }
@@ -1188,7 +1481,7 @@ app.get('/api/admin/flags', adminAuth, (req, res) => {
 
 app.patch('/api/admin/flags', adminAuth, async (req, res, next) => {
     try {
-        const allowed = ['maintenanceMode', 'voiceEnabled', 'rankedEnabled', 'maxPlayers', 'minStartingCards', 'maxStartingCards'];
+        const allowed = ['maintenanceMode', 'voiceEnabled', 'rankedEnabled', 'maxPlayers', 'minStartingCards', 'maxStartingCards', 'autoFillQueueWithBots'];
         const nextFlags = { ...featureFlags };
         for (const key of allowed) {
             if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) nextFlags[key] = req.body[key];
@@ -1198,7 +1491,8 @@ app.patch('/api/admin/flags', adminAuth, async (req, res, next) => {
             || nextFlags.maxPlayers < 2 || nextFlags.maxPlayers > MAX_PLAYERS_PER_ROOM
             || !Number.isInteger(nextFlags.minStartingCards) || nextFlags.minStartingCards < 4
             || !Number.isInteger(nextFlags.maxStartingCards) || nextFlags.maxStartingCards > 8
-            || nextFlags.minStartingCards > nextFlags.maxStartingCards) {
+            || nextFlags.minStartingCards > nextFlags.maxStartingCards
+            || typeof nextFlags.autoFillQueueWithBots !== 'boolean') {
             return res.status(400).json({ error: 'Invalid feature flag values.' });
         }
         const wasMaintenanceMode = featureFlags.maintenanceMode;
@@ -1347,6 +1641,10 @@ app.post('/api/admin/rooms/:roomId/action', adminAuth, async (req, res, next) =>
             if (!player) return res.status(400).json({ error: 'Target player is not in this room.' });
             drawFromMarket(game, player.uid, Math.max(1, Math.min(5, Number(req.body?.count) || 1)));
             broadcastGameState(game);
+        } else if (action === 'reshuffle_market') {
+            if (game.state !== 'playing' || !Array.isArray(game.market)) return res.status(409).json({ error: 'The room has no active market to reshuffle.' });
+            game.market = shuffleCards(game.market);
+            broadcastGameState(game);
         } else if (action === 'kick') {
             const player = game.players.find((entry) => entry.uid === req.body?.uid);
             if (!player) return res.status(400).json({ error: 'Target player is not in this room.' });
@@ -1462,6 +1760,23 @@ io.on('connection', (socket) => {
         trackConnection(socket, { uid, name });
         return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id, ip };
     }
+
+    socket.on('register_player_presence', async (data, callback) => {
+        try {
+            const decoded = firebaseReady ? await verifyPlayerToken(data?.idToken) : null;
+            if (!decoded?.uid) throw new Error('Player authentication is required.');
+            const email = decoded.email || '';
+            const name = decoded.name || (email ? email.split('@')[0] : 'Player');
+            const photoURL = decoded.picture || null;
+            const ip = clientIp(socket);
+            const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+            socket.playerData = { uid: decoded.uid, name, email, photoURL, isAdmin, ip };
+            trackConnection(socket, { uid: decoded.uid, name });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Player authentication failed.' });
+        }
+    });
 
     socket.on('create_room', async (playerData, callback) => {
         try {
@@ -1693,7 +2008,7 @@ io.on('connection', (socket) => {
                     state: 'waiting',
                     settings: { ...DEFAULT_SETTINGS, ...suggestSettings(roomPlayers.length) },
                     turnIndex: 0,
-                    createdAt: new Date().toLocaleTimeString(),
+                    createdAt: new Date().toISOString(),
                 };
                 socket.data.roomId = roomId;
                 opponent.socket.data.roomId = roomId;
@@ -1787,6 +2102,10 @@ io.on('connection', (socket) => {
                 : wild || (activeShape ? cardSuit === activeShape || cardValue === topValue : cardSuit === topSuit || cardValue === topValue);
             if (!legal) { emitActionError(socket, 'That card cannot be played on the current discard.', 'game_action_error'); return; }
 
+            metrics.cardsPlayed += 1;
+            recordGameplayAction(socket, data, 'PLAY_CARD', {
+                card: { label: card.label, value: card.value, suit: card.suit },
+            });
             if (hand.length === 2 && !actor.calledLastCard) drawFromMarket(game, actor.uid, 1);
             hand.splice(cardIndex, 1);
             actor.calledLastCard = false;
@@ -1858,6 +2177,7 @@ io.on('connection', (socket) => {
             const turnIndexBefore = game.turnIndex;
             const wasPenalty = game.pendingPenalty > 0;
             const analysisContext = captureReplayContext(game, actor.uid);
+            recordGameplayAction(socket, data, wasPenalty ? 'PENALTY_DRAW' : 'DRAW_CARD', { count });
             drawFromMarket(game, actor.uid, count);
             actor.calledLastCard = false;
             if (game.pendingPenalty > 0) {
@@ -1886,6 +2206,7 @@ io.on('connection', (socket) => {
         const turn = activeGameForTurn(data);
         if (!turn) { emitActionError(socket, 'It is not your turn or this game is no longer active.', 'game_action_error'); return; }
         const { game } = turn;
+        recordGameplayAction(socket, data, 'PASS_TURN');
         const turnIndexBefore = game.turnIndex;
         const analysisContext = captureReplayContext(game, turn.actor.uid);
         if (!game.hasDrawnThisTurn || game.pendingPenalty > 0) {
@@ -1912,6 +2233,7 @@ io.on('connection', (socket) => {
             return;
         }
         turn.actor.calledLastCard = !turn.actor.calledLastCard;
+        recordGameplayAction(socket, data, 'CALL_LAST_CARD');
         broadcastGameState(turn.game);
     });
 
@@ -1924,6 +2246,7 @@ io.on('connection', (socket) => {
             return;
         }
         turn.game.announcedShape = { uid: turn.actor.uid, shape };
+        recordGameplayAction(socket, data, 'CALL_WHOT', { requestedShape: String(shape).toLowerCase() });
         void recordReplayTurn(turn.game, {
             actionType: 'whot',
             actorUid: turn.actor.uid,
@@ -1998,7 +2321,7 @@ io.on('connection', (socket) => {
                     const happyHourMultiplier = happyHourIsActive() ? happyHour.multiplier : 1;
                     const playersByUid = new Map(
                         game.players
-                            .filter((player) => isNonEmptyString(player.uid, 200))
+                            .filter((player) => !player.isBot && isNonEmptyString(player.uid, 200))
                             .map((player) => [player.uid, player])
                     );
                     const players = [...playersByUid.values()];
@@ -2019,7 +2342,6 @@ io.on('connection', (socket) => {
                                 })),
                             participantUids: (game.matchPlayers || game.players).map((player) => player.uid),
                             winnerUid,
-                            rankingPointsMultiplier: happyHourMultiplier,
                             rankingPointsMultiplier: happyHourMultiplier,
                                 ...(!game.matchId ? { createdAt: FieldValue.serverTimestamp() } : {}),
                             playedAt: FieldValue.serverTimestamp(),
@@ -2064,7 +2386,7 @@ io.on('connection', (socket) => {
 
     socket.on('get_admin_data', async (data, callback) => {
         try {
-            await requireAdminToken(data?.idToken);
+            await authenticateAdminSocket(socket, data?.idToken);
             const payload = await adminMetrics();
             payload.activeRooms = payload.roomSummaries;
             socket.emit('admin_data_response', payload);
@@ -2076,7 +2398,7 @@ io.on('connection', (socket) => {
 
     socket.on('get_security_logs', async (data, callback) => {
         try {
-            await requireAdminToken(data?.idToken);
+            await authenticateAdminSocket(socket, data?.idToken);
             const logs = [...securityLogs];
             socket.emit('security_logs_response', { logs });
             if (typeof callback === 'function') callback({ logs });
@@ -2084,6 +2406,86 @@ io.on('connection', (socket) => {
             const response = { error: error.message || 'Unauthorized.' };
             socket.emit('security_logs_response', response);
             if (typeof callback === 'function') callback(response);
+        }
+    });
+
+    socket.on('admin_authenticate', async (data, callback) => {
+        try {
+            const admin = await authenticateAdminSocket(socket, data?.idToken);
+            await auditAdminAction(admin, 'admin_socket_authenticate', socket.id);
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Unauthorized.' });
+        }
+    });
+
+    socket.on('admin_ping', async (data, callback) => {
+        try {
+            await authenticateAdminSocket(socket, data?.idToken);
+            if (typeof callback === 'function') callback({ serverTime: Date.now() });
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Unauthorized.' });
+        }
+    });
+
+    socket.on('admin_simulate_traffic', async (data, callback) => {
+        try {
+            const admin = await authenticateAdminSocket(socket, data?.idToken);
+            const players = Number(data?.players);
+            if (![10, 50].includes(players)) throw new Error('Simulation size must be 10 or 50 virtual players.');
+            const totalSimulated = [...trafficSimulations.values()].reduce((sum, session) => sum + session.players, 0);
+            if (totalSimulated + players > 100) throw new Error('Virtual traffic is capped at 100 concurrent players.');
+            const id = `sim-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+            const session = {
+                players,
+                rooms: Math.ceil(players / 2),
+                expiresAt: Date.now() + 30_000,
+                timer: null,
+                virtualSockets: Array.from({ length: players }, (_, index) => ({
+                    id: `${id}-socket-${index + 1}`,
+                    connected: true,
+                    joinedQueue: true,
+                    eventsExchanged: 0,
+                })),
+            };
+            session.timer = setInterval(() => {
+                if (session.expiresAt <= Date.now()) return;
+                const now = Date.now();
+                session.virtualSockets.forEach((mockSocket) => {
+                    if (!mockSocket.connected) return;
+                    mockSocket.eventsExchanged += 1;
+                    mockSocket.joinedQueue = !mockSocket.joinedQueue;
+                });
+                for (let index = 0; index < Math.min(10, players); index += 1) gameplayActionTimes.push(now);
+            }, 1000);
+            trafficSimulations.set(id, session);
+            await auditAdminAction(admin, 'simulate_traffic', id, { players, durationSeconds: 30 });
+            const response = { success: true, players, expiresAt: new Date(session.expiresAt).toISOString() };
+            if (typeof callback === 'function') callback(response);
+            sampleTelemetry();
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Traffic simulation failed.' });
+        }
+    });
+
+    socket.on('admin_send_direct_warning', async (data, callback) => {
+        try {
+            const admin = await authenticateAdminSocket(socket, data?.idToken);
+            const targetUid = String(data?.targetUid || '');
+            const message = String(data?.message || '').trim().slice(0, 300);
+            if (!isNonEmptyString(targetUid, 200) || !message) throw new Error('A player ID and warning message are required.');
+            let delivered = 0;
+            for (const targetSocket of io.sockets.sockets.values()) {
+                if (targetSocket.playerData?.uid === targetUid) {
+                    targetSocket.emit('admin_direct_warning', { message, sentAt: new Date().toISOString() });
+                    delivered += 1;
+                }
+            }
+            if (!delivered) throw new Error('The target player is not currently connected.');
+            await auditAdminAction(admin, 'send_direct_warning', targetUid, { message: message.slice(0, 120), delivered });
+            if (typeof callback === 'function') callback({ success: true, delivered });
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Direct warning failed.' });
         }
     });
 
@@ -2160,6 +2562,7 @@ io.on('connection', (socket) => {
     socket.on('disconnect', async (reason) => {
         try {
             activeConnections.delete(socket.id);
+            adminSocketSessions.delete(socket.id);
             for (const [roomId, spectators] of ghostSpectators) {
                 spectators.delete(socket.id);
                 if (!spectators.size) ghostSpectators.delete(roomId);
