@@ -63,6 +63,8 @@ const io = new Server(server, {
 // ─── Live Server State (RAM) ───
 const queue = [];
 const activeGames = {};
+const securityLogs = [];
+const MAX_SECURITY_LOGS = 100;
 const metrics = {
     gamesStarted: 0,
     gamesCompleted: 0,
@@ -88,6 +90,28 @@ function log(emoji, message) {
 
 function isNonEmptyString(value, maxLength = 100) {
     return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function recordSecurityEvent(type, severity, { uid = null, name = null, roomId = null, ip = null, details = '' } = {}) {
+    const event = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        type,
+        uid,
+        name,
+        roomId,
+        ip,
+        severity,
+        details: String(details).slice(0, 300),
+    };
+    securityLogs.unshift(event);
+    if (securityLogs.length > MAX_SECURITY_LOGS) securityLogs.length = MAX_SECURITY_LOGS;
+    log('SECURITY', `${severity} ${type} uid=${uid || 'unknown'} room=${roomId || 'none'} ${event.details}`);
+    return event;
+}
+
+function clientIp(socket) {
+    return String(socket.handshake?.address || socket.conn?.remoteAddress || 'unknown').replace(/^::ffff:/, '');
 }
 
 function getServerStats() {
@@ -134,8 +158,144 @@ function auditAdminAction(actor, action, target, meta = {}) {
     });
 }
 
+function evaluateReplayAction(game, event) {
+    const uid = event.actorUid;
+    const context = event.analysisContext || {};
+    if (!uid) return {};
+    const hand = Array.isArray(context.actorHandBefore) ? context.actorHandBefore : [];
+    const history = Array.isArray(context.discardPileBefore) ? context.discardPileBefore : [];
+    const handCounts = context.handsCountBefore || {};
+    const activeShape = String(context.activeShapeBefore || cardShape(history[history.length - 1]) || '').toLowerCase();
+    const shapeTotals = Object.fromEntries(
+        Object.entries({ circles: 11, triangles: 11, crosses: 10, squares: 10, stars: 7 })
+            .map(([shape, count]) => [shape, count * Math.max(1, Number(game.settings?.decks) || 1)]),
+    );
+    const normalizeShape = (card) => String(cardShape(card) || '').toLowerCase();
+    const discarded = Object.fromEntries(Object.keys(shapeTotals).map((shape) => [shape, 0]));
+    for (const card of history) {
+        const shape = normalizeShape(card);
+        if (Object.hasOwn(discarded, shape)) discarded[shape] += 1;
+    }
+    const opponents = Object.entries(handCounts).filter(([opponentUid]) => opponentUid !== uid);
+    const shapeCall = event.actionType === 'call_whot' && event.requestedShape;
+    let grade;
+    let insight;
+
+    if (event.actionType === 'draw' && activeShape
+        && !hand.some((card) => normalizeShape(card) === activeShape)) {
+        const gaps = game.analysisKnownGaps || (game.analysisKnownGaps = {});
+        const playerGaps = gaps[uid] || (gaps[uid] = []);
+        if (!playerGaps.includes(activeShape)) playerGaps.push(activeShape);
+    }
+
+    const requestedShape = String(event.requestedShape || '').toLowerCase();
+    const exploitedGap = requestedShape && opponents.some(([opponentUid]) =>
+        game.analysisKnownGaps?.[opponentUid]?.includes(requestedShape),
+    );
+    if (shapeCall) {
+        const chosen = requestedShape;
+        const total = shapeTotals[chosen];
+        if (exploitedGap) {
+            grade = 'great';
+            insight = `Called ${chosen} to exploit a previously observed opponent gap.`;
+        } else if (total) {
+            const ratio = (discarded[chosen] || 0) / total;
+            const bestShape = Object.keys(shapeTotals).reduce((best, shape) => {
+                const remaining = (shapeTotals[shape] - discarded[shape]) / shapeTotals[shape];
+                return remaining > best.remaining ? { shape, remaining } : best;
+            }, { shape: '', remaining: -1 });
+            if (ratio >= 0.75 && bestShape.shape !== chosen && bestShape.remaining > 1 - ratio) {
+                grade = 'inaccuracy';
+                insight = `Called ${chosen} after ${Math.round(ratio * 100)}% of its cards were discarded.`;
+            } else {
+                grade = 'best';
+                insight = `Called ${chosen} with ${Math.round((1 - ratio) * 100)}% of its deck cards still unseen.`;
+            }
+        }
+    } else if (event.actionType === 'play' || event.actionType === 'whot') {
+        const card = event.card;
+        const number = cardNumber(card);
+        const shape = normalizeShape(card);
+        const threats = opponents.filter(([, count]) => Number(count) <= 2);
+        const isWild = isWildCard(card);
+        const top = history[history.length - 1];
+        const playableNonWild = hand.some((candidate) => {
+            if (isWildCard(candidate)) return false;
+            const candidateShape = normalizeShape(candidate);
+            return activeShape
+                ? candidateShape === activeShape || cardNumber(candidate) === cardNumber(top)
+                : candidateShape === normalizeShape(top) || cardNumber(candidate) === cardNumber(top);
+        });
+        const pickCard = number === 2 || number === 5;
+        if (pickCard && threats.length) {
+            grade = 'great';
+            insight = `Applied a pick penalty with an opponent at ${Math.min(...threats.map(([, count]) => Number(count)))} cards.`;
+        } else if (isWild && playableNonWild) {
+            grade = 'blunder';
+            insight = 'Used a Whot wildcard while a non-wild playable card was available.';
+        } else if (shape && opponents.some(([opponentUid]) =>
+            game.analysisKnownGaps?.[opponentUid]?.includes(shape),
+        )) {
+            grade = 'great';
+            insight = `Played ${shape} against a previously observed opponent gap.`;
+        } else {
+            const playable = hand.filter((candidate) => {
+                if (isWildCard(candidate)) return true;
+                const candidateShape = normalizeShape(candidate);
+                return activeShape
+                    ? candidateShape === activeShape || cardNumber(candidate) === cardNumber(top)
+                    : candidateShape === normalizeShape(top) || cardNumber(candidate) === cardNumber(top);
+            });
+            const bestShape = playable.reduce((best, candidate) => {
+                const candidateShape = normalizeShape(candidate);
+                const candidateTotal = shapeTotals[candidateShape] || 1;
+                const remaining = (candidateTotal - (discarded[candidateShape] || 0)) / candidateTotal;
+                return remaining > best.remaining ? { shape: candidateShape, remaining } : best;
+            }, { shape: '', remaining: -1 });
+            const remainingRatio = shapeTotals[shape]
+                ? (shapeTotals[shape] - (discarded[shape] || 0)) / shapeTotals[shape]
+                : 0;
+            if (bestShape.shape && bestShape.shape !== shape && remainingRatio < 0.25) {
+                grade = 'inaccuracy';
+                insight = `Played ${shape} with few cards remaining despite another legal option.`;
+            } else {
+                grade = 'best';
+                insight = 'Selected a strong legal play from the information available.';
+            }
+        }
+    }
+
+    const serial = context.turnSerialBefore;
+    if (event.actionType === 'play' && [2, 5].includes(cardNumber(event.card))) {
+        game.analysisHeldPickTurns = game.analysisHeldPickTurns || {};
+        game.analysisHeldPickTurns[uid] = 0;
+    } else if (serial !== undefined && ['play', 'draw', 'pass', 'penalty_draw'].includes(event.actionType)) {
+        game.analysisLastTurnSerial = game.analysisLastTurnSerial || {};
+        if (game.analysisLastTurnSerial[uid] !== serial) {
+            game.analysisLastTurnSerial[uid] = serial;
+            const holdingPick = hand.some((card) => [2, 5].includes(cardNumber(card)));
+            game.analysisHeldPickTurns = game.analysisHeldPickTurns || {};
+            game.analysisHeldPickTurns[uid] = holdingPick ? (game.analysisHeldPickTurns[uid] || 0) + 1 : 0;
+            if (game.analysisHeldPickTurns[uid] >= 4 && opponents.some(([, count]) => Number(count) <= 2)) {
+                grade = 'blunder';
+                insight = `Held a pick penalty for ${game.analysisHeldPickTurns[uid]} turns while an opponent had two or fewer cards.`;
+            }
+        }
+    }
+
+    if (grade) {
+        game.analysisEvaluations = game.analysisEvaluations || [];
+        game.analysisEvaluations.push({ uid, grade, insight, turnNumber: game.replayTurnNumber || 0 });
+    }
+    return { grade, insight };
+}
+
 function replaySnapshot(game, event) {
     const top = game.discardPile?.[game.discardPile.length - 1] || null;
+    const analysis = event.analysisContext || {};
+    const evaluation = evaluateReplayAction(game, event);
+    const toReplayCard = (card) => ({ id: card.id, shape: cardShape(card), number: cardNumber(card) });
+    const matchPlayers = game.matchPlayers || game.players;
     return {
         turnNumber: game.replayTurnNumber || 0,
         actorUid: event.actorUid || null,
@@ -150,18 +310,40 @@ function replaySnapshot(game, event) {
         penaltyAmount: event.penaltyAmount ?? null,
         turnIndexBefore: event.turnIndexBefore ?? game.turnIndex,
         turnIndexAfter: game.turnIndex,
+        turnSerialBefore: analysis.turnSerialBefore ?? game.turnSerial ?? 0,
+        turnSerialAfter: game.turnSerial ?? 0,
         marketCountAfter: game.market?.length ?? 0,
+        marketCountBefore: analysis.marketCountBefore ?? game.market?.length ?? 0,
         discardTopAfter: top ? {
             id: top.id,
             shape: cardShape(top),
             number: cardNumber(top),
         } : null,
+        discardPileAfter: (game.discardPile || []).map(toReplayCard),
+        discardPileBefore: (analysis.discardPileBefore || []).map(toReplayCard),
+        handsCountBefore: analysis.handsCountBefore || {},
+        activeShapeBefore: analysis.activeShapeBefore || null,
         activeShapeAfter: game.activeSuit || null,
-        handsCountAfter: Object.fromEntries(game.players.map((player) => [
+        handsCountAfter: Object.fromEntries(matchPlayers.map((player) => [
             player.uid,
             (game.handsByUid?.[player.uid] || []).length,
         ])),
+        ...evaluation,
         timestamp: new Date().toISOString(),
+    };
+}
+
+function captureReplayContext(game, actorUid) {
+    return {
+        turnSerialBefore: game.turnSerial || 0,
+        marketCountBefore: game.market?.length || 0,
+        activeShapeBefore: game.activeSuit || null,
+        actorHandBefore: [...(game.handsByUid?.[actorUid] || [])],
+        discardPileBefore: [...(game.discardPile || [])],
+        handsCountBefore: Object.fromEntries((game.matchPlayers || game.players).map((player) => [
+            player.uid,
+            (game.handsByUid?.[player.uid] || []).length,
+        ])),
     };
 }
 
@@ -222,28 +404,53 @@ async function createReplayMatch(game) {
 
 async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'normal' } = {}) {
     if (!db || !game.matchId) return;
-    await recordReplayTurn(game, {
-        actionType: 'game_end',
-        actorUid: winnerUid,
-        actorName: game.players.find((player) => player.uid === winnerUid)?.name || null,
-        turnIndexBefore: game.turnIndex,
-    });
-    await game.replayWrite;
-    const endedAt = new Date();
-    await db.collection('matches').doc(game.matchId).set({
-        winnerUid,
-        endedAt: FieldValue.serverTimestamp(),
-        durationSec: game.startedAt ? Math.max(0, Math.floor((endedAt - game.startedAt) / 1000)) : 0,
-        totalMoves: Math.max(0, game.replayTurnNumber - 1),
-        resultType,
-        status: 'ended',
-        finalSummary: {
-            handCounts: Object.fromEntries((game.matchPlayers || game.players).map((player) => [
-                player.uid,
-                (game.handsByUid?.[player.uid] || []).length,
-            ])),
-        },
-    }, { merge: true });
+    if (game.replayFinalized) return game.replayFinalization || Promise.resolve();
+    game.replayFinalized = true;
+    game.replayFinalization = (async () => {
+        await recordReplayTurn(game, {
+            actionType: 'game_end',
+            actorUid: winnerUid,
+            actorName: (game.matchPlayers || game.players).find((player) => player.uid === winnerUid)?.name || null,
+            turnIndexBefore: game.turnIndex,
+        });
+        await game.replayWrite;
+        const endedAt = new Date();
+        const analysisEvaluations = game.analysisEvaluations || [];
+        const analysisReports = (game.matchPlayers || game.players).map((player) => {
+            const evaluated = analysisEvaluations.filter((entry) => entry.uid === player.uid);
+            const breakdown = { great: 0, best: 0, inaccuracy: 0, blunder: 0 };
+            for (const entry of evaluated) breakdown[entry.grade] += 1;
+            const optimal = breakdown.great + breakdown.best;
+            return {
+                uid: player.uid,
+                name: player.name,
+                accuracy: evaluated.length ? Math.round((optimal / evaluated.length) * 100) : 0,
+                evaluatedMoves: evaluated.length,
+                breakdown,
+                insights: evaluated
+                    .filter((entry) => entry.insight && ['great', 'inaccuracy', 'blunder'].includes(entry.grade))
+                    .slice(0, 5)
+                    .map((entry) => `Move ${entry.turnNumber}: ${entry.insight}`),
+            };
+        });
+        await db.collection('matches').doc(game.matchId).set({
+            winnerUid,
+            endedAt: FieldValue.serverTimestamp(),
+            durationSec: game.startedAt ? Math.max(0, Math.floor((endedAt - game.startedAt) / 1000)) : 0,
+            totalMoves: Math.max(0, game.replayTurnNumber - 1),
+            resultType,
+            status: 'ended',
+            finalSummary: {
+                handCounts: Object.fromEntries((game.matchPlayers || game.players).map((player) => [
+                    player.uid,
+                    (game.handsByUid?.[player.uid] || []).length,
+                ])),
+                analysisReports,
+            },
+            analysisReports,
+        }, { merge: true });
+    })();
+    return game.replayFinalization;
 }
 
 async function requireAdminToken(token) {
@@ -291,6 +498,52 @@ function emitRoomClosed(game, message) {
         }
     }
     delete activeGames[game.roomId];
+}
+
+async function enforcePlayerBan(uid) {
+    const queued = queue.filter((entry) => entry.playerData.uid === uid);
+    for (const entry of queued) {
+        emitActionError(entry.socket, 'Your account is restricted from online play.');
+    }
+    for (let index = queue.length - 1; index >= 0; index -= 1) {
+        if (queue[index].playerData.uid === uid) queue.splice(index, 1);
+    }
+
+    const affectedRooms = Object.values(activeGames).filter((game) =>
+        game.players.some((player) => player.uid === uid),
+    );
+    for (const game of affectedRooms) {
+        const player = game.players.find((entry) => entry.uid === uid);
+        const targetSocket = player && io.sockets.sockets.get(player.socketId);
+        if (targetSocket) {
+            targetSocket.emit('room_closed', {
+                roomId: game.roomId,
+                message: 'Your account has been restricted from online play.',
+            });
+            targetSocket.leave(game.roomId);
+            targetSocket.data.roomId = null;
+        }
+        game.players = game.players.filter((entry) => entry.uid !== uid);
+        if (game.state === 'playing') {
+            game.state = 'ended';
+            game.status = 'ended';
+            game.winnerUid = game.players.length === 1 ? game.players[0].uid : null;
+            await persistAdminEndedGame(game, { winnerUid: game.winnerUid, resultType: 'player_ban' });
+            io.to(game.roomId).emit('game_ended', {
+                roomId: game.roomId,
+                winnerUid: game.winnerUid,
+                matchId: game.matchId || null,
+                resultType: 'player_ban',
+            });
+            delete activeGames[game.roomId];
+        } else if (game.players.length === 0) {
+            delete activeGames[game.roomId];
+        } else {
+            if (game.hostUid === uid) game.hostUid = game.players[0].uid;
+            syncHostState(game);
+            broadcastRoom(game);
+        }
+    }
 }
 
 async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'forfeit' } = {}) {
@@ -388,7 +641,7 @@ async function assertPlayerAllowed(uid) {
     if (featureFlags.maintenanceMode) throw new Error('The game is temporarily unavailable for maintenance.');
     if (!db || !uid) return;
     const snapshot = await db.collection('users').doc(uid).get();
-    if (snapshot.exists && isPlayerBanned(snapshot.data())) throw new Error('Your account is restricted from online play.');
+    if (snapshot.exists && isPlayerBanned(snapshot.data())) throw new Error('Account suspended for policy violations.');
 }
 
 const DEFAULT_SETTINGS = { minPlayers: 2, maxPlayers: 6, startingHandSize: 6, decks: 1 };
@@ -604,6 +857,7 @@ app.get('/api/admin/players', adminAuth, async (req, res, next) => {
             .filter((player) => !search || String(player.displayName || '').toLowerCase().includes(search)
                 || String(player.email || '').toLowerCase().includes(search)
                 || player.uid.toLowerCase().includes(search))
+            .filter((player) => req.query.banned !== 'true' || isPlayerBanned(player))
             .map((player) => ({
                 uid: player.uid,
                 displayName: player.displayName || player.email || player.uid,
@@ -613,6 +867,21 @@ app.get('/api/admin/players', adminAuth, async (req, res, next) => {
                 wins: player.wins || 0,
             }));
         res.json({ players });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/admin/security', adminAuth, async (req, res, next) => {
+    try {
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const alerts24h = securityLogs.filter((event) => new Date(event.timestamp).getTime() >= cutoff).length;
+        let activeBans = 0;
+        if (db) {
+            const users = await db.collection('users').limit(1000).get();
+            activeBans = users.docs.filter((userDoc) => isPlayerBanned(userDoc.data())).length;
+        }
+        res.json({ securityLogs: [...securityLogs], alerts24h, activeBans });
     } catch (error) {
         next(error);
     }
@@ -637,31 +906,7 @@ app.patch('/api/admin/players/:uid/ban', adminAuth, async (req, res, next) => {
             updatedAt: new Date().toISOString(),
         }, { merge: true });
         if (req.body.banned) {
-            const affectedRooms = Object.values(activeGames).filter((game) => game.players.some((player) => player.uid === uid));
-            for (const game of affectedRooms) {
-                const player = game.players.find((entry) => entry.uid === uid);
-                const targetSocket = player && io.sockets.sockets.get(player.socketId);
-                if (targetSocket) {
-                    targetSocket.emit('room_closed', { roomId: game.roomId, message: 'Your account has been restricted from online play.' });
-                    targetSocket.leave(game.roomId);
-                    targetSocket.data.roomId = null;
-                }
-                game.players = game.players.filter((entry) => entry.uid !== uid);
-                if (game.state === 'playing') {
-                    game.state = 'ended';
-                    game.status = 'ended';
-                    game.winnerUid = game.players.length === 1 ? game.players[0].uid : null;
-                    await persistAdminEndedGame(game, { winnerUid: game.winnerUid, resultType: 'player_ban' });
-                    io.to(game.roomId).emit('game_ended', { roomId: game.roomId, winnerUid: game.winnerUid, matchId: game.matchId || null });
-                    delete activeGames[game.roomId];
-                } else if (game.players.length === 0) {
-                    delete activeGames[game.roomId];
-                } else {
-                    if (game.hostUid === uid) game.hostUid = game.players[0].uid;
-                    syncHostState(game);
-                    broadcastRoom(game);
-                }
-            }
+            if (req.body.banned) await enforcePlayerBan(uid);
         }
         await auditAdminAction(req.admin, req.body.banned ? 'ban_player' : 'unban_player', uid, {
             durationHours: req.body.durationHours || null,
@@ -848,20 +1093,47 @@ app.use((err, req, res, next) => {
 // ─── Socket.io Gameplay ───
 io.on('connection', (socket) => {
     log('🟢', `Player connected: ${socket.id}`);
+    socket.data.requestStartedAt = Date.now();
+    socket.data.requestCount = 0;
+    socket.data.throttledUntil = 0;
+    socket.use((packet, next) => {
+        const now = Date.now();
+        if (now < socket.data.throttledUntil) return;
+        if (now - socket.data.requestStartedAt >= 1000) {
+            socket.data.requestStartedAt = now;
+            socket.data.requestCount = 0;
+        }
+        socket.data.requestCount += 1;
+        if (socket.data.requestCount > 10) {
+            socket.data.throttledUntil = now + 5000;
+            recordSecurityEvent('RATE_LIMIT_EXCEEDED', 'WARNING', {
+                uid: socket.playerData?.uid,
+                name: socket.playerData?.name,
+                ip: clientIp(socket),
+                roomId: socket.data.roomId,
+                details: 'More than 10 client events in one second; socket throttled for five seconds.',
+            });
+            socket.emit('action_error', { error: 'Too many actions. Please wait five seconds.' });
+            return;
+        }
+        next();
+    });
 
     async function resolveRoomPlayer(playerData) {
         if (!playerData || typeof playerData !== 'object') throw new Error('Invalid player data.');
-        let decoded = null;
-        if (firebaseReady) decoded = await verifyPlayerToken(playerData.idToken);
-        const uid = decoded?.uid || (isNonEmptyString(playerData.uid, 200) ? playerData.uid.trim() : '');
+        const decoded = firebaseReady ? await verifyPlayerToken(playerData.idToken) : null;
+        const uid = firebaseReady
+            ? decoded.uid
+            : (isNonEmptyString(playerData.uid, 200) ? playerData.uid.trim() : '');
         if (!uid) throw new Error('Unable to verify player identity.');
         await assertPlayerAllowed(uid);
         const email = decoded?.email || '';
         const name = playerData.name || decoded?.name || (email ? email.split('@')[0] : 'Player');
         const photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : (decoded?.picture || null);
         const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
-        socket.playerData = { uid, name, email, photoURL, isAdmin };
-        return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id };
+        const ip = clientIp(socket);
+        socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
+        return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id, ip };
     }
 
     socket.on('create_room', async (playerData, callback) => {
@@ -896,6 +1168,16 @@ io.on('connection', (socket) => {
                 throw new Error(`Room is full (${Math.min(room.settings.maxPlayers, featureFlags.maxPlayers)} players maximum).`);
             }
             if (room.players.some((existing) => existing.uid === player.uid)) throw new Error('You are already in this room.');
+            const colliding = room.players.find((existing) => existing.ip && existing.ip === player.ip);
+            if (colliding) {
+                recordSecurityEvent('SAME_IP_COLLUSION', 'WARNING', {
+                    uid: player.uid,
+                    name: player.name,
+                    ip: player.ip,
+                    roomId,
+                    details: `Same client IP as ${colliding.name} (${colliding.uid}) joined this room.`,
+                });
+            }
             room.players.push(player);
             syncHostState(room);
             socket.join(roomId);
@@ -949,6 +1231,7 @@ io.on('connection', (socket) => {
         }
         room.state = 'playing';
         room.ranked = featureFlags.rankedEnabled;
+        room.turnSerial = 0;
         const startingPlayerIndex = Math.floor(Math.random() * playerCount);
         room.turnIndex = startingPlayerIndex;
         const deal = createDeal(room);
@@ -1023,20 +1306,14 @@ io.on('connection', (socket) => {
             let email = '';
             let photoURL = null;
 
-            if (firebaseReady && playerData.idToken) {
+            if (firebaseReady) {
                 const decoded = await verifyPlayerToken(playerData.idToken);
-                if (decoded) {
-                    uid = decoded.uid;
-                    email = decoded.email || '';
-                    name = playerData.name || decoded.name || (email ? email.split('@')[0] : 'Player');
-                    photoURL = isNonEmptyString(playerData.photoURL, 2048)
-                        ? playerData.photoURL
-                        : (decoded.picture || null);
-                } else {
-                    uid = playerData.uid ? playerData.uid.trim() : socket.id;
-                    name = playerData.name ? playerData.name.trim() : 'Player';
-                    photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : null;
-                }
+                uid = decoded.uid;
+                email = decoded.email || '';
+                name = playerData.name || decoded.name || (email ? email.split('@')[0] : 'Player');
+                photoURL = isNonEmptyString(playerData.photoURL, 2048)
+                    ? playerData.photoURL
+                    : (decoded.picture || null);
             } else {
                 if (!isNonEmptyString(playerData.name) || !isNonEmptyString(playerData.uid)) {
                     const errMsg = 'Name and uid are required when Firebase token is not provided.';
@@ -1050,7 +1327,8 @@ io.on('connection', (socket) => {
 
             const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
             await assertPlayerAllowed(uid);
-            socket.playerData = { uid, name, email, photoURL, isAdmin };
+            const ip = clientIp(socket);
+            socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
 
             if (queue.length > 0) {
                 const opponent = queue.shift();
@@ -1065,6 +1343,15 @@ io.on('connection', (socket) => {
                     { socketId: opponent.socket.id, ...opponent.playerData, isHost: true },
                     { socketId: socket.id, ...socket.playerData, isHost: false },
                 ];
+                if (roomPlayers[0].ip && roomPlayers[0].ip === roomPlayers[1].ip) {
+                    recordSecurityEvent('SAME_IP_COLLUSION', 'WARNING', {
+                        uid,
+                        name,
+                        ip,
+                        roomId,
+                        details: `Queued opponents ${roomPlayers[0].name} and ${roomPlayers[1].name} share a client IP.`,
+                    });
+                }
 
                 if (roomPlayers.length > MAX_PLAYERS_PER_ROOM) {
                     if (typeof callback === 'function') callback({ error: 'Room is full.' });
@@ -1121,7 +1408,17 @@ io.on('connection', (socket) => {
         if (!validateRoomAction(data)) return null;
         const game = activeGames[data.roomId];
         const actor = game.players.find((player) => player.socketId === socket.id);
-        if (!actor || game.state !== 'playing' || game.status !== 'playing' || game.players[game.turnIndex]?.uid !== actor.uid) return null;
+        if (!actor || game.state !== 'playing' || game.status !== 'playing') return null;
+        if (game.players[game.turnIndex]?.socketId !== socket.id) {
+            recordSecurityEvent('OUT_OF_TURN_ACTION', 'WARNING', {
+                uid: actor.uid,
+                name: actor.name,
+                ip: actor.ip,
+                roomId: game.roomId,
+                details: `Action arrived while seat ${game.turnIndex} owned the turn.`,
+            });
+            return null;
+        }
         return { game, actor };
     }
 
@@ -1132,8 +1429,19 @@ io.on('connection', (socket) => {
             const { game, actor } = turn;
             const hand = game.handsByUid[actor.uid] || [];
             const turnIndexBefore = game.turnIndex;
+            const analysisContext = captureReplayContext(game, actor.uid);
             const cardIndex = hand.findIndex((card) => card.id === data.cardId);
-            if (cardIndex < 0) { emitActionError(socket, 'That card is not in your hand.', 'game_action_error'); return; }
+            if (cardIndex < 0) {
+                recordSecurityEvent('DESYNC_HAND_TAMPERING', 'CRITICAL', {
+                    uid: actor.uid,
+                    name: actor.name,
+                    ip: actor.ip,
+                    roomId: game.roomId,
+                    details: `Submitted card ${String(data.cardId || '').slice(0, 80)} is absent from the server-recorded hand.`,
+                });
+                emitActionError(socket, 'That card is not in your hand.', 'game_action_error');
+                return;
+            }
             const card = hand[cardIndex];
             const topCard = game.discardPile[game.discardPile.length - 1];
             const requestedShape = String(data.requestedShape ?? data.namedSuit ?? '').toLowerCase();
@@ -1181,6 +1489,7 @@ io.on('connection', (socket) => {
             }
 
             game.announcedShape = null;
+            game.turnSerial = (game.turnSerial || 0) + 1;
             void recordReplayTurn(game, {
                 actionType: wild ? 'whot' : 'play',
                 actorUid: actor.uid,
@@ -1188,7 +1497,11 @@ io.on('connection', (socket) => {
                 card,
                 requestedShape: wild ? requestedShape : null,
                 turnIndexBefore,
+                analysisContext,
             });
+            if (hand.length === 0) {
+                await finalizeReplayMatch(game, { winnerUid: actor.uid, resultType: 'normal' });
+            }
             socket.to(data.roomId).emit('opponent_played_card', {
                 roomId: data.roomId,
                 playerId: actor.uid,
@@ -1216,6 +1529,7 @@ io.on('connection', (socket) => {
             const count = game.pendingPenalty > 0 ? game.pendingPenalty : 1;
             const turnIndexBefore = game.turnIndex;
             const wasPenalty = game.pendingPenalty > 0;
+            const analysisContext = captureReplayContext(game, actor.uid);
             drawFromMarket(game, actor.uid, count);
             actor.calledLastCard = false;
             if (game.pendingPenalty > 0) {
@@ -1223,6 +1537,7 @@ io.on('connection', (socket) => {
                 game.penaltyType = null;
                 game.hasDrawnThisTurn = false;
                 game.turnIndex = (game.turnIndex + 1) % game.players.length;
+                game.turnSerial = (game.turnSerial || 0) + 1;
             } else {
                 game.hasDrawnThisTurn = true;
             }
@@ -1232,6 +1547,7 @@ io.on('connection', (socket) => {
                 actorName: actor.name,
                 penaltyAmount: wasPenalty ? count : null,
                 turnIndexBefore,
+                analysisContext,
             });
             socket.to(data.roomId).emit('opponent_drew_card', { roomId: data.roomId, playerId: actor.uid, count });
             broadcastGameState(game);
@@ -1243,17 +1559,20 @@ io.on('connection', (socket) => {
         if (!turn) { emitActionError(socket, 'It is not your turn or this game is no longer active.', 'game_action_error'); return; }
         const { game } = turn;
         const turnIndexBefore = game.turnIndex;
+        const analysisContext = captureReplayContext(game, turn.actor.uid);
         if (!game.hasDrawnThisTurn || game.pendingPenalty > 0) {
             emitActionError(socket, 'Draw a card before passing.', 'game_action_error');
             return;
         }
         game.hasDrawnThisTurn = false;
         game.turnIndex = (game.turnIndex + 1) % game.players.length;
+        game.turnSerial = (game.turnSerial || 0) + 1;
         void recordReplayTurn(game, {
             actionType: 'pass',
             actorUid: turn.actor.uid,
             actorName: turn.actor.name,
             turnIndexBefore,
+            analysisContext,
         });
         broadcastGameState(game);
     });
@@ -1283,6 +1602,7 @@ io.on('connection', (socket) => {
             actorName: turn.actor.name,
             requestedShape: shape,
             turnIndexBefore: turn.game.turnIndex,
+            analysisContext: captureReplayContext(turn.game, turn.actor.uid),
         });
         socket.to(data.roomId).emit('opponent_called_whot', { roomId: data.roomId, playerId: turn.actor.uid, namedSuit: shape });
     });
@@ -1420,6 +1740,50 @@ io.on('connection', (socket) => {
             if (typeof callback === 'function') callback({ error: err.message || 'Unauthorized.' });
         }
     });
+
+    socket.on('get_security_logs', async (data, callback) => {
+        try {
+            await requireAdminToken(data?.idToken);
+            const logs = [...securityLogs];
+            socket.emit('security_logs_response', { logs });
+            if (typeof callback === 'function') callback({ logs });
+        } catch (error) {
+            const response = { error: error.message || 'Unauthorized.' };
+            socket.emit('security_logs_response', response);
+            if (typeof callback === 'function') callback(response);
+        }
+    });
+
+    const updateSocketBan = async (data, banned, callback) => {
+        try {
+            const admin = await requireAdminToken(data?.idToken);
+            const uid = String(data?.targetUid || '');
+            if (!db) throw new Error('Player moderation is unavailable.');
+            if (!uid || uid.length > 200) throw new Error('A valid player ID is required.');
+            await db.collection('users').doc(uid).set({
+                banned,
+                status: banned ? 'banned' : 'active',
+                banUntil: null,
+                banReason: banned ? String(data?.reason || 'Administrative moderation').slice(0, 300) : null,
+                updatedAt: new Date().toISOString(),
+            }, { merge: true });
+            if (banned) await enforcePlayerBan(uid);
+            const event = recordSecurityEvent(banned ? 'ADMIN_BAN' : 'ADMIN_UNBAN', 'INFO', {
+                uid,
+                details: `Account ${banned ? 'banned' : 'unbanned'} by ${admin.email}.`,
+            });
+            await auditAdminAction(admin, banned ? 'ban_player' : 'unban_player', uid);
+            const response = { success: true, event };
+            socket.emit('admin_ban_result', response);
+            if (typeof callback === 'function') callback(response);
+        } catch (error) {
+            const response = { error: error.message || 'Moderation failed.' };
+            socket.emit('admin_ban_result', response);
+            if (typeof callback === 'function') callback(response);
+        }
+    };
+    socket.on('admin_ban_user', (data, callback) => { void updateSocketBan(data, true, callback); });
+    socket.on('admin_unban_user', (data, callback) => { void updateSocketBan(data, false, callback); });
 
     socket.on('disconnect', async (reason) => {
         try {
