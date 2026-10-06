@@ -702,10 +702,12 @@ io.on('connection', (socket) => {
             if (!validateRoomAction(data)) return;
 
             const game = activeGames[data.roomId];
-            const winnerUid = data.winnerUid || data.winnerId;
             if (game.ending) return;
-            if (!isNonEmptyString(winnerUid, 200) || !game.players.some((player) => player.uid === winnerUid)) {
-                socket.emit('action_error', { error: 'Winner must be a player in this room.' });
+            const winnerUid = game.winnerUid;
+            if (game.state !== 'ended' || game.status !== 'ended'
+                || !isNonEmptyString(winnerUid, 200)
+                || !game.players.some((player) => player.uid === winnerUid)) {
+                socket.emit('action_error', { error: 'The server has not confirmed this game result.' });
                 return;
             }
             game.ending = true;
