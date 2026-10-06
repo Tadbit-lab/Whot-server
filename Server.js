@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const crypto = require('crypto');
 
 // ─── Config ───
 const PORT = process.env.PORT || 3001;
@@ -49,7 +50,11 @@ try {
 
 // ─── Express + Socket.io ───
 const app = express();
-app.use(cors());
+app.use(cors({
+    origin: true,
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'x-admin-key', 'x-admin-token'],
+}));
 app.use(express.json());
 
 const server = http.createServer(app);
@@ -65,6 +70,7 @@ const queue = [];
 const activeGames = {};
 const securityLogs = [];
 const MAX_SECURITY_LOGS = 100;
+let latestAnnouncement = null;
 const metrics = {
     gamesStarted: 0,
     gamesCompleted: 0,
@@ -108,6 +114,38 @@ function recordSecurityEvent(type, severity, { uid = null, name = null, roomId =
     if (securityLogs.length > MAX_SECURITY_LOGS) securityLogs.length = MAX_SECURITY_LOGS;
     log('SECURITY', `${severity} ${type} uid=${uid || 'unknown'} room=${roomId || 'none'} ${event.details}`);
     return event;
+}
+
+function announcementIsActive(announcement) {
+    return Boolean(announcement && (!announcement.expiresAt || new Date(announcement.expiresAt).getTime() > Date.now()));
+}
+
+function createAnnouncement({ id, message, priority, sticky, expiresAt } = {}) {
+    const cleanMessage = String(message || '').trim();
+    if (!isNonEmptyString(cleanMessage, 500)) throw new Error('Announcement must be 1–500 characters.');
+    const cleanPriority = ['info', 'warning', 'urgent'].includes(priority) ? priority : 'info';
+    let normalizedExpiry = null;
+    if (expiresAt) {
+        const parsedExpiry = new Date(expiresAt);
+        if (!Number.isFinite(parsedExpiry.getTime()) || parsedExpiry.getTime() <= Date.now()) {
+            throw new Error('Announcement expiry must be a valid future date.');
+        }
+        normalizedExpiry = parsedExpiry.toISOString();
+    }
+    return {
+        id: id || `announcement-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        message: cleanMessage,
+        priority: cleanPriority,
+        sticky: Boolean(sticky),
+        createdAt: new Date().toISOString(),
+        expiresAt: normalizedExpiry,
+    };
+}
+
+function broadcastAnnouncement(payload) {
+    latestAnnouncement = payload;
+    io.emit('admin_broadcast', payload);
+    return payload;
 }
 
 function clientIp(socket) {
@@ -454,7 +492,7 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
 }
 
 async function requireAdminToken(token) {
-    if (!auth || !ADMIN_EMAIL) throw new Error('Admin authentication is unavailable.');
+    if (!firebaseReady || !auth || !ADMIN_EMAIL) throw new Error('Admin authentication is unavailable. Configure Firebase Admin and ADMIN_EMAIL.');
     const decoded = await verifyPlayerToken(token);
     if (!decoded?.email || decoded.email.toLowerCase() !== ADMIN_EMAIL) {
         throw new Error('Unauthorized.');
@@ -462,16 +500,39 @@ async function requireAdminToken(token) {
     return { uid: decoded.uid, email: decoded.email };
 }
 
-async function adminAuth(req, res, next) {
+async function adminAuthMiddleware(req, res, next) {
     try {
         const authorization = String(req.headers.authorization || '');
-        const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-        req.admin = await requireAdminToken(token);
-        next();
+        const keyParam = req.query.key || req.headers['x-admin-key'] || req.headers['x-admin-token'];
+        const configuredAdminKey = String(process.env.ADMIN_KEY || '');
+        if (configuredAdminKey && keyParam !== undefined) {
+            const supplied = Buffer.from(String(keyParam));
+            const configured = Buffer.from(configuredAdminKey);
+            if (supplied.length === configured.length && crypto.timingSafeEqual(supplied, configured)) {
+                req.admin = { uid: 'admin-key', email: 'admin-key' };
+                req.adminAuthMethod = 'admin_key';
+                return next();
+            }
+        }
+
+        if (authorization.startsWith('Bearer ') && firebaseReady && auth) {
+            const decoded = await auth.verifyIdToken(authorization.slice('Bearer '.length).trim());
+            const userEmail = String(decoded?.email || '').trim().toLowerCase();
+            if (userEmail && ADMIN_EMAIL && userEmail === ADMIN_EMAIL) {
+                req.admin = { uid: decoded.uid, email: decoded.email };
+                req.adminUser = decoded;
+                req.adminAuthMethod = 'firebase_token';
+                return next();
+            }
+        }
+
+        return res.status(401).json({ error: 'Unauthorized admin access. Invalid key or token.' });
     } catch (error) {
-        res.status(401).json({ error: error.message || 'Unauthorized.' });
+        return res.status(401).json({ error: 'Unauthorized. Auth verification failed.' });
     }
 }
+
+const adminAuth = adminAuthMiddleware;
 
 function emitActionError(socket, message, event = 'action_error') {
     metrics.actionErrors += 1;
@@ -638,14 +699,13 @@ function isPlayerBanned(user) {
 }
 
 async function assertPlayerAllowed(uid) {
-    if (featureFlags.maintenanceMode) throw new Error('The game is temporarily unavailable for maintenance.');
     if (!db || !uid) return;
     const snapshot = await db.collection('users').doc(uid).get();
     if (snapshot.exists && isPlayerBanned(snapshot.data())) throw new Error('Account suspended for policy violations.');
 }
 
 const DEFAULT_SETTINGS = { minPlayers: 2, maxPlayers: 6, startingHandSize: 6, decks: 1 };
-const ADMIN_EMAIL = String(process.env.VITE_ADMIN_EMAIL || process.env.ADMIN_EMAIL || '').toLowerCase();
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || process.env.VITE_ADMIN_EMAIL || '').trim().toLowerCase();
 const CARD_RANKS = {
     circles: [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 14],
     triangles: [1, 2, 3, 4, 5, 7, 8, 10, 11, 12, 14],
@@ -798,6 +858,13 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', ...getServerStats() });
 });
 
+app.get('/api/announcement', (req, res) => {
+    res.json({
+        announcement: announcementIsActive(latestAnnouncement) ? latestAnnouncement : null,
+        maintenanceMode: Boolean(featureFlags.maintenanceMode),
+    });
+});
+
 app.get('/api/stats', (req, res) => {
     res.json(getServerStats());
 });
@@ -947,10 +1014,23 @@ app.patch('/api/admin/flags', adminAuth, async (req, res, next) => {
             || nextFlags.minStartingCards > nextFlags.maxStartingCards) {
             return res.status(400).json({ error: 'Invalid feature flag values.' });
         }
+        const wasMaintenanceMode = featureFlags.maintenanceMode;
         featureFlags = nextFlags;
         if (db) await db.collection('adminConfig').doc('flags').set(featureFlags, { merge: true });
         await auditAdminAction(req.admin, 'update_flags', 'global', featureFlags);
         io.emit('feature_flags_updated', featureFlags);
+        io.emit('maintenance_status', { maintenanceMode: featureFlags.maintenanceMode });
+        if (featureFlags.maintenanceMode && !wasMaintenanceMode) {
+            broadcastAnnouncement(createAnnouncement({
+                message: 'Scheduled maintenance in progress. Online matches are temporarily unavailable.',
+                priority: 'urgent',
+                sticky: true,
+                id: 'maintenance',
+            }));
+        } else if (!featureFlags.maintenanceMode && wasMaintenanceMode && latestAnnouncement?.id === 'maintenance') {
+            latestAnnouncement = null;
+            io.emit('announcement_cleared', { id: 'maintenance' });
+        }
         res.json({ flags: featureFlags });
     } catch (error) {
         next(error);
@@ -995,18 +1075,27 @@ app.delete('/api/admin/queue/:uid', adminAuth, async (req, res, next) => {
     }
 });
 
-app.post('/api/admin/announcement', adminAuth, async (req, res, next) => {
+async function handleAdminBroadcast(req, res, next) {
     try {
-        const message = String(req.body?.message || '').trim();
-        if (!isNonEmptyString(message, 500)) return res.status(400).json({ error: 'Announcement must be 1–500 characters.' });
-        const announcement = { message, sentAt: new Date().toISOString() };
-        io.emit('admin_announcement', announcement);
-        await auditAdminAction(req.admin, 'broadcast_announcement', 'all_players', { message });
+        const announcement = createAnnouncement({ ...(req.body || {}), id: undefined });
+        broadcastAnnouncement(announcement);
+        await auditAdminAction(req.admin, 'broadcast_announcement', 'all_players', {
+            id: announcement.id,
+            priority: announcement.priority,
+            sticky: announcement.sticky,
+            expiresAt: announcement.expiresAt,
+        });
         res.json({ announcement });
     } catch (error) {
+        if (error instanceof Error && /Announcement/.test(error.message)) {
+            return res.status(400).json({ error: error.message });
+        }
         next(error);
     }
-});
+}
+
+app.post('/api/admin/broadcast', adminAuth, handleAdminBroadcast);
+app.post('/api/admin/announcement', adminAuth, handleAdminBroadcast);
 
 app.post('/api/admin/rooms/:roomId/action', adminAuth, async (req, res, next) => {
     try {
@@ -1093,6 +1182,9 @@ app.use((err, req, res, next) => {
 // ─── Socket.io Gameplay ───
 io.on('connection', (socket) => {
     log('🟢', `Player connected: ${socket.id}`);
+    if (announcementIsActive(latestAnnouncement)) socket.emit('server_announcement', latestAnnouncement);
+    socket.emit('feature_flags_updated', featureFlags);
+    socket.emit('maintenance_status', { maintenanceMode: Boolean(featureFlags.maintenanceMode) });
     socket.data.requestStartedAt = Date.now();
     socket.data.requestCount = 0;
     socket.data.throttledUntil = 0;
@@ -1126,11 +1218,11 @@ io.on('connection', (socket) => {
             ? decoded.uid
             : (isNonEmptyString(playerData.uid, 200) ? playerData.uid.trim() : '');
         if (!uid) throw new Error('Unable to verify player identity.');
-        await assertPlayerAllowed(uid);
         const email = decoded?.email || '';
         const name = playerData.name || decoded?.name || (email ? email.split('@')[0] : 'Player');
         const photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : (decoded?.picture || null);
         const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+        await assertPlayerAllowed(uid);
         const ip = clientIp(socket);
         socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
         return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id, ip };
@@ -1138,8 +1230,8 @@ io.on('connection', (socket) => {
 
     socket.on('create_room', async (playerData, callback) => {
         try {
-            if (featureFlags.maintenanceMode) throw new Error('Online play is temporarily unavailable for maintenance.');
             const player = await resolveRoomPlayer(playerData);
+            if (featureFlags.maintenanceMode && !player.isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
             const roomId = String(playerData.roomId || '').trim().toUpperCase();
             if (!isNonEmptyString(roomId, 24)) throw new Error('A valid room code is required.');
             if (activeGames[roomId]) throw new Error('That room code is already in use.');
@@ -1159,8 +1251,8 @@ io.on('connection', (socket) => {
 
     socket.on('join_room', async (playerData, callback) => {
         try {
-            if (featureFlags.maintenanceMode) throw new Error('Online play is temporarily unavailable for maintenance.');
             const player = await resolveRoomPlayer(playerData);
+            if (featureFlags.maintenanceMode && !player.isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
             const roomId = String(playerData.roomId || '').trim().toUpperCase();
             const room = activeGames[roomId];
             if (!room || room.state !== 'waiting') throw new Error('Room not found or game already started.');
@@ -1207,7 +1299,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('start_game', async (data) => {
-        if (featureFlags.maintenanceMode) {
+        if (featureFlags.maintenanceMode && !socket.playerData?.isAdmin) {
             emitActionError(socket, 'Online play is temporarily unavailable for maintenance.');
             return;
         }
@@ -1280,7 +1372,6 @@ io.on('connection', (socket) => {
     // Join matchmaking
     socket.on('join_queue', async (playerData, callback) => {
         try {
-            if (featureFlags.maintenanceMode) throw new Error('Online play is temporarily unavailable for maintenance.');
             if (matchmakingPaused) throw new Error('Matchmaking is temporarily paused.');
             if (!playerData || typeof playerData !== 'object') {
                 const errMsg = 'Invalid player data.';
@@ -1329,6 +1420,7 @@ io.on('connection', (socket) => {
             await assertPlayerAllowed(uid);
             const ip = clientIp(socket);
             socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
+            if (featureFlags.maintenanceMode && !isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
 
             if (queue.length > 0) {
                 const opponent = queue.shift();
