@@ -2837,3 +2837,22 @@ const RESOURCE_EXHAUSTED_FALLBACK = (err, req, res, next) => {
   next(err);
 };
 app.use('/api/admin', RESOURCE_EXHAUSTED_FALLBACK);
+
+
+// --- EXPRESS FIRESTORE QUOTA 500 INTERCEPTOR ---
+app.use((err, req, res, next) => {
+  // EXPRESS_QUOTA_PROTECTION
+  if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
+    console.warn('⚠️ Quota exceeded on ' + req.path + ' - returning degraded HTTP 200 payload.');
+    return res.status(200).json({
+      degraded: true,
+      error: 'Firestore quota limit reached. Operating in degraded mode.',
+      players: [],
+      auditLogs: [],
+      securityLogs: [],
+      matches: [],
+      metrics: { activeMatches: 0, connectedPlayers: 0 }
+    });
+  }
+  next(err);
+});
