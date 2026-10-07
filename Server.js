@@ -3045,3 +3045,37 @@ app.get('/api/admin/audit', (req, res) => {
 app.get('/api/admin/security', (req, res) => {
   return res.json({ securityLogs: [], degraded: false });
 });
+
+
+// --- ADMIN VOICE BROADCAST ENDPOINT & SOCKET FANOUT ---
+app.post('/api/admin/broadcast-voice', adminAuth, async (req, res, next) => {
+  try {
+    const { audioData, durationSec, priority } = req.body || {};
+    if (!audioData) {
+      return res.status(400).json({ error: 'Audio payload required' });
+    }
+
+    const payload = {
+      id: `voice-announcement-${Date.now()}`,
+      type: 'voice',
+      audioUrl: audioData, // Base64 Data URI
+      durationSec: durationSec || 0,
+      priority: priority || 'urgent',
+      message: 'Admin Voice Announcement',
+      createdAt: new Date().toISOString()
+    };
+
+    // Fan out to all connected clients via Socket.io
+    io.emit('admin_voice_broadcast', payload);
+    io.emit('admin_broadcast', payload);
+
+    await auditAdminAction(req.admin, 'broadcast_voice_announcement', 'all_players', {
+      durationSec,
+      priority
+    });
+
+    res.json({ success: true, payload });
+  } catch (err) {
+    next(err);
+  }
+});
