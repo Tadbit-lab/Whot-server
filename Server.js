@@ -1,3 +1,31 @@
+
+process.on('unhandledRejection', (reason, promise) => {
+  if (reason && (reason.code === 8 || reason.message?.includes('RESOURCE_EXHAUSTED'))) {
+    console.warn('⚠️ Intercepted async Firestore quota exhaustion promise rejection.');
+    return;
+  }
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+
+// Safe wrapper for async Firestore admin routes
+const safeAdminHandler = (handler, fallbackData = {}) => async (req, res, next) => {
+  try {
+    await handler(req, res, next);
+  } catch (err) {
+    if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
+      console.warn(`⚠️ Firestore quota hit on ${req.path} - returning degraded fallback payload.`);
+      return res.status(200).json({
+        degraded: true,
+        error: 'Firestore quota limit exceeded. Operating in degraded mode.',
+        ...fallbackData
+      });
+    }
+    console.error(`❌ Unhandled error on ${req.path}:`, err);
+    return res.status(200).json({ degraded: true, ...fallbackData });
+  }
+};
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
