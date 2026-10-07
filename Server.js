@@ -1,4 +1,15 @@
 
+// MULTI-ADMIN EMAIL HELPER
+function isAdminEmail(email) {
+  if (!email) return false;
+  const target = String(email).trim().toLowerCase();
+  const rawEnv = String(process.env.ADMIN_EMAIL || process.env.VITE_ADMIN_EMAIL || '').toLowerCase();
+  const list = rawEnv.split(',').map(e => e.trim()).filter(Boolean);
+  if (!list.includes('vironrazia01@gmail.com')) list.push('vironrazia01@gmail.com');
+  return list.includes(target);
+}
+
+
 // ============================================================================
 // --- LOCAL SQLITE MIRROR DATABASE ENGINE (0ms LATENCY / ZERO FIRESTORE QUOTA) ---
 // ============================================================================
@@ -876,7 +887,7 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
 async function requireAdminToken(token) {
     if (!firebaseReady || !auth || !ADMIN_EMAIL) throw new Error('Admin authentication is unavailable. Configure Firebase Admin and ADMIN_EMAIL.');
     const decoded = await verifyPlayerToken(token);
-    if (!decoded?.email || decoded.email.toLowerCase() !== ADMIN_EMAIL) {
+    if (!decoded?.email || !isAdminEmail(decoded.email)) {
         throw new Error('Unauthorized.');
     }
     return { uid: decoded.uid, email: decoded.email };
@@ -900,7 +911,7 @@ async function adminAuthMiddleware(req, res, next) {
         if (authorization.startsWith('Bearer ') && firebaseReady && auth) {
             const decoded = await auth.verifyIdToken(authorization.slice('Bearer '.length).trim());
             const userEmail = String(decoded?.email || '').trim().toLowerCase();
-            if (userEmail && ADMIN_EMAIL && userEmail === ADMIN_EMAIL) {
+            if (userEmail && ADMIN_EMAIL && isAdminEmail(userEmail)) {
                 req.admin = { uid: decoded.uid, email: decoded.email };
                 req.adminUser = decoded;
                 req.adminAuthMethod = 'firebase_token';
@@ -1970,7 +1981,7 @@ io.on('connection', (socket) => {
         const email = decoded?.email || '';
         const name = playerData.name || decoded?.name || (email ? email.split('@')[0] : 'Player');
         const photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : (decoded?.picture || null);
-        const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+        const isAdmin = Boolean(ADMIN_EMAIL && isAdminEmail(email));
         await assertPlayerAllowed(uid);
         const cosmetics = await loadPlayerCosmetics(uid, photoURL);
         const profilePhoto = cosmetics.photoURL;
@@ -1989,7 +2000,7 @@ io.on('connection', (socket) => {
             const name = decoded.name || (email ? email.split('@')[0] : 'Player');
             const photoURL = decoded.picture || null;
             const ip = clientIp(socket);
-            const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+            const isAdmin = Boolean(ADMIN_EMAIL && isAdminEmail(email));
             socket.playerData = { uid: decoded.uid, name, email, photoURL, isAdmin, ip };
             trackConnection(socket, { uid: decoded.uid, name });
             if (typeof callback === 'function') callback({ success: true });
@@ -2186,7 +2197,7 @@ io.on('connection', (socket) => {
                 photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : null;
             }
 
-            const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
+            const isAdmin = Boolean(ADMIN_EMAIL && isAdminEmail(email));
             await assertPlayerAllowed(uid);
             const cosmetics = await loadPlayerCosmetics(uid, photoURL);
             const ip = clientIp(socket);
