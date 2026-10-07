@@ -1,4 +1,26 @@
 
+function makeQuotaSafeHandler(handler, fallbackPayload = {}) {
+  return async (req, res, next) => {
+    try {
+      await handler(req, res, next);
+    } catch (err) {
+      console.warn('Quota/route intercept on', req.originalUrl, ':', err && err.message ? err.message : err);
+      return res.status(200).json(Object.assign({
+        degraded: true,
+        error: 'Firestore quota limit reached. System running in degraded mode.',
+        players: [],
+        matches: [],
+        auditLogs: [],
+        securityLogs: [],
+        metrics: { activeMatches: 0, connectedPlayers: 0 }
+      }, fallbackPayload));
+    }
+  };
+}
+
+
+// QUOTA_SAFE_PATCH_APPLIED 2026-10-07T19:55:22.490Z
+
 process.on('unhandledRejection', (reason, promise) => {
   if (reason && (reason.code === 8 || reason.message?.includes('RESOURCE_EXHAUSTED'))) {
     console.warn('⚠️ Intercepted async Firestore quota exhaustion promise rejection.');
@@ -2855,4 +2877,21 @@ app.use((err, req, res, next) => {
     });
   }
   next(err);
+});
+
+
+// EXPRESS_QUOTA_FALLBACK_MARK
+app.use(function (err, req, res, next) {
+  if (err && (err.code === 8 || String(err.message || '').includes('RESOURCE_EXHAUSTED') || String(err.message || '').includes('Quota exceeded'))) {
+    return res.status(200).json({
+      degraded: true,
+      error: 'Firestore quota limit reached. System running in degraded mode.',
+      players: [],
+      matches: [],
+      auditLogs: [],
+      securityLogs: [],
+      metrics: { activeMatches: 0, connectedPlayers: 0 }
+    });
+  }
+  return next(err);
 });
