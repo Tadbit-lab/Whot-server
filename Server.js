@@ -1,4 +1,112 @@
 
+// ============================================================================
+// --- LOCAL SQLITE MIRROR DATABASE ENGINE (0ms LATENCY / ZERO FIRESTORE QUOTA) ---
+// ============================================================================
+let sqliteDb = null;
+try {
+  const Database = require('better-sqlite3');
+  sqliteDb = new Database(require('path').join(__dirname, 'whot_local_mirror.db'));
+  sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS players (
+      uid TEXT PRIMARY KEY,
+      name TEXT,
+      photoURL TEXT,
+      wins INTEGER DEFAULT 0,
+      losses INTEGER DEFAULT 0,
+      lastSeen DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS matches (
+      id TEXT PRIMARY KEY,
+      winner TEXT,
+      playedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event TEXT,
+      details TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  console.log('⚡ Local SQLite mirror database initialized successfully!');
+} catch (err) {
+  console.warn('⚠️ SQLite initialization notice:', err.message);
+}
+
+// Helper Functions
+function sqliteUpsertPlayer(uid, name, photoURL = '', wins = 0, losses = 0) {
+  if (!sqliteDb || !uid) return;
+  try {
+    const stmt = sqliteDb.prepare(`
+      INSERT INTO players (uid, name, photoURL, wins, losses, lastSeen)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(uid) DO UPDATE SET
+        name = COALESCE(NULLIF(excluded.name, ''), players.name),
+        photoURL = COALESCE(NULLIF(excluded.photoURL, ''), players.photoURL),
+        wins = MAX(players.wins, excluded.wins),
+        losses = MAX(players.losses, excluded.losses),
+        lastSeen = CURRENT_TIMESTAMP
+    `);
+    stmt.run(uid, name || 'Player', photoURL || '', wins || 0, losses || 0);
+  } catch (e) {}
+}
+
+function sqliteRecordMatch(id, winner) {
+  if (!sqliteDb || !id) return;
+  try {
+    const stmt = sqliteDb.prepare('INSERT OR REPLACE INTO matches (id, winner) VALUES (?, ?)');
+    stmt.run(id, winner || 'Unknown');
+  } catch (e) {}
+}
+
+function sqliteLogAudit(event, details) {
+  if (!sqliteDb) return;
+  try {
+    const stmt = sqliteDb.prepare('INSERT INTO audit_logs (event, details) VALUES (?, ?)');
+    stmt.run(event, typeof details === 'string' ? details : JSON.stringify(details));
+  } catch (e) {}
+}
+
+// Startup Firestore Hydration / Background Sync
+async function syncHistoricalDataFromFirestore() {
+  if (!sqliteDb || typeof db === 'undefined' || !db) return;
+  
+  // 1. Sync Past Players
+  try {
+    const usersSnapshot = await db.collection('users').get();
+    let userCount = 0;
+    usersSnapshot.forEach(doc => {
+      const data = doc.data();
+      sqliteUpsertPlayer(doc.id, data.displayName || 'Player', data.photoURL || '', data.wins || 0, data.losses || 0);
+      userCount++;
+    });
+    console.log(`✅ Synced ${userCount} past players from Firestore to local SQLite!`);
+  } catch (err) {
+    console.warn('⚠️ Firestore player sync notice:', err.message || err);
+  }
+
+  // 2. Sync Past Matches
+  try {
+    const matchesSnapshot = await db.collection('matches').orderBy('playedAt', 'desc').limit(100).get();
+    let matchCount = 0;
+    matchesSnapshot.forEach(doc => {
+      const data = doc.data();
+      const playedAtStr = data.playedAt ? (data.playedAt.toDate ? data.playedAt.toDate().toISOString() : data.playedAt) : new Date().toISOString();
+      sqliteRecordMatch(doc.id, data.winnerUid || data.winner || 'Unknown');
+      matchCount++;
+    });
+    console.log(`✅ Synced ${matchCount} past matches from Firestore to local SQLite!`);
+  } catch (err) {
+    console.warn('⚠️ Firestore match sync notice (Quota active or offline): Using existing SQLite match records.');
+  }
+}
+
+// Trigger background sync 5s after startup
+setTimeout(() => {
+  syncHistoricalDataFromFirestore();
+}, 5000);
+// ============================================================================
+
+
 function makeQuotaSafeHandler(handler, fallbackPayload = {}) {
   return async (req, res, next) => {
     try {
@@ -2894,4 +3002,46 @@ app.use(function (err, req, res, next) {
     });
   }
   return next(err);
+});
+
+
+// --- ADMIN ROUTES SERVED DIRECTLY FROM SQLITE (0ms / ZERO FIRESTORE READS) ---
+app.get('/api/admin/players', (req, res) => {
+  try {
+    let players = [];
+    if (sqliteDb) {
+      players = sqliteDb.prepare('SELECT * FROM players ORDER BY lastSeen DESC LIMIT 100').all();
+    }
+    return res.json({ players, source: 'sqlite_cache', degraded: false });
+  } catch (e) {
+    return res.json({ players: [], degraded: true });
+  }
+});
+
+app.get('/api/admin/matches', (req, res) => {
+  try {
+    let matches = [];
+    if (sqliteDb) {
+      matches = sqliteDb.prepare('SELECT * FROM matches ORDER BY playedAt DESC LIMIT 50').all();
+    }
+    return res.json({ matches, source: 'sqlite_cache', degraded: false });
+  } catch (e) {
+    return res.json({ matches: [], degraded: true });
+  }
+});
+
+app.get('/api/admin/audit', (req, res) => {
+  try {
+    let auditLogs = [];
+    if (sqliteDb) {
+      auditLogs = sqliteDb.prepare('SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50').all();
+    }
+    return res.json({ auditLogs, source: 'sqlite_cache', degraded: false });
+  } catch (e) {
+    return res.json({ auditLogs: [], degraded: true });
+  }
+});
+
+app.get('/api/admin/security', (req, res) => {
+  return res.json({ securityLogs: [], degraded: false });
 });
