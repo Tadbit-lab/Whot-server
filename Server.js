@@ -68,6 +68,8 @@ const io = new Server(server, {
 // ─── Live Server State (RAM) ───
 const queue = [];
 const activeGames = {};
+/** In-memory tournament bracket state; durable tournament storage is not configured. */
+const tournaments = new Map();
 const securityLogs = [];
 const MAX_SECURITY_LOGS = 100;
 let latestAnnouncement = null;
@@ -839,6 +841,19 @@ async function enforcePlayerBan(uid) {
     }
 }
 
+function progressionForMatch(current, won) {
+    const wins = (typeof current.wins === 'number' ? current.wins : 0) + (won ? 1 : 0);
+    const matches = (typeof current.matchesPlayed === 'number' ? current.matchesPlayed : 0) + 1;
+    const streak = won ? (typeof current.winStreak === 'number' ? current.winStreak : 0) + 1 : 0;
+    const unlocked = new Set(Array.isArray(current.achievementsUnlocked) ? current.achievementsUnlocked : []);
+    if (wins >= 1) unlocked.add('first_win');
+    if (wins >= 10) unlocked.add('wins_10');
+    if (wins >= 25) unlocked.add('wins_25');
+    if (matches >= 10) unlocked.add('table_regular');
+    if (streak >= 3) unlocked.add('undefeated_3');
+    return { xpEarned: won ? 150 : 50, achievementsUnlocked: [...unlocked] };
+}
+
 async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'forfeit' } = {}) {
     game.state = 'ended';
     game.status = 'ended';
@@ -860,6 +875,7 @@ async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'for
             const won = player.uid === winnerUid;
             const streak = typeof current.winStreak === 'number' ? current.winStreak : 0;
             const best = typeof current.bestWinStreak === 'number' ? current.bestWinStreak : 0;
+            const progression = progressionForMatch(current, won);
             transaction.set(userRefs[index], {
                 wins: FieldValue.increment(won ? 1 : 0),
                 losses: FieldValue.increment(winnerUid && !won ? 1 : 0),
@@ -868,6 +884,8 @@ async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'for
                 bestWinStreak: won ? Math.max(best, streak + 1) : best,
                 rankingPoints: FieldValue.increment(won ? happyHourMultiplier : 0),
                 happyHourWins: FieldValue.increment(won && happyHourMultiplier > 1 ? 1 : 0),
+                xp: FieldValue.increment(progression.xpEarned),
+                achievementsUnlocked: progression.achievementsUnlocked,
                 updatedAt: new Date().toISOString(),
                 lastPlayedAt: new Date().toISOString(),
             }, { merge: true });
@@ -875,11 +893,17 @@ async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'for
     });
 }
 
+let cachedMatchMetrics = null;
+let cachedMatchMetricsAt = 0;
+const ADMIN_METRICS_CACHE_TTL = 15 * 60 * 1000;
+
 async function adminMetrics() {
     const rooms = Object.values(activeGames).map(publicRoomSummary);
     let gamesLast24h = 0;
     let totalMatches = metrics.gamesCompleted;
     let forfeitCount = metrics.forfeits;
+    let degraded = false;
+    let cached = false;
     if (db) {
         try {
             const recentCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -895,7 +919,16 @@ async function adminMetrics() {
             }).length;
         } catch (error) {
             log('⚠️', `Admin match metrics query failed: ${error.message}`);
+            degraded = true;
+            if (cachedMatchMetrics && Date.now() - cachedMatchMetricsAt <= ADMIN_METRICS_CACHE_TTL) {
+                ({ gamesLast24h, totalMatches, forfeitCount } = cachedMatchMetrics);
+                cached = true;
+            }
         }
+    }
+    if (db && !degraded) {
+        cachedMatchMetrics = { gamesLast24h, totalMatches, forfeitCount };
+        cachedMatchMetricsAt = Date.now();
     }
     const memory = process.memoryUsage();
     return {
@@ -912,6 +945,8 @@ async function adminMetrics() {
         matchmakingPaused,
         flags: featureFlags,
         roomSummaries: rooms,
+        degraded,
+        cached,
     };
 }
 
@@ -1000,9 +1035,33 @@ function syncHostState(room) {
     room.players.forEach((player) => { player.isHost = player.uid === room.hostUid; });
     return nextHost;
 }
+async function loadPlayerCosmetics(uid, fallbackPhotoURL = null) {
+    let data = {};
+    if (db) {
+        try {
+            const snapshot = await db.collection('users').doc(uid).get();
+            if (snapshot.exists) data = snapshot.data() || {};
+        } catch (error) {
+            log('⚠️', `Could not load cosmetics for ${uid}: ${error.message}`);
+        }
+    }
+    const allowed = (value, choices, fallback) => choices.includes(value) ? value : fallback;
+    return {
+        avatarId: allowed(data.avatarId, Array.from({ length: 12 }, (_, index) => `avatar_${String(index + 1).padStart(2, '0')}`), 'avatar_01'),
+        avatarStyle: allowed(data.avatarStyle, ['preset', 'dicebear'], 'preset'),
+        avatarFrameId: allowed(data.avatarFrameId, ['none', 'thin_steel', 'gold_ring', 'streak_ring', 'champion_laurel'], 'none'),
+        titleId: allowed(data.titleId, ['the_seer', 'market_boss', 'last_card', 'sharp_player', 'senior_man', 'table_kingpin'], null),
+        badgeId: allowed(data.badgeId, ['sharp', 'clutch', 'seer', 'market', 'chaos', 'patient', 'bully', 'diplomat'], null),
+        cardBackId: allowed(data.cardBackId, ['classic', 'ankara', 'gold_foil', 'midnight_neon', 'naija_stripe', 'obsidian'], 'classic'),
+        tableThemeId: allowed(data.tableThemeId, ['lagos_green', 'warri_emerald', 'royal_gold', 'night_black'], 'lagos_green'),
+        showcaseBadgeIds: Array.isArray(data.showcaseBadgeIds) ? data.showcaseBadgeIds.filter((id) => typeof id === 'string').slice(0, 3) : [],
+        photoURL: typeof data.photoURL === 'string' && (/^https:\/\/api\.dicebear\.com\/7\.x\/(bottts|identicon)\/svg\?seed=/.test(data.photoURL) || /^https:\/\/res\.cloudinary\.com\/[A-Za-z0-9_-]+\/image\/upload\//.test(data.photoURL)) ? data.photoURL : fallbackPhotoURL,
+    };
+}
+
 function publicRoom(room) {
     syncHostState(room);
-    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, isHost, isAdmin, isBot, calledLastCard }) => ({ uid, name, photoURL, isHost, isAdmin, isBot: Boolean(isBot), calledLastCard: Boolean(calledLastCard) })),
+    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, isHost, isAdmin, isBot, calledLastCard }) => ({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, isHost, isAdmin, isBot: Boolean(isBot), calledLastCard: Boolean(calledLastCard) })),
         state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
 }
 function broadcastRoom(room) {
@@ -1755,10 +1814,13 @@ io.on('connection', (socket) => {
         const photoURL = isNonEmptyString(playerData.photoURL, 2048) ? playerData.photoURL : (decoded?.picture || null);
         const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
         await assertPlayerAllowed(uid);
+        const cosmetics = await loadPlayerCosmetics(uid, photoURL);
+        const profilePhoto = cosmetics.photoURL;
+        delete cosmetics.photoURL;
         const ip = clientIp(socket);
-        socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
+        socket.playerData = { uid, name, email, photoURL: profilePhoto, ...cosmetics, isAdmin, ip };
         trackConnection(socket, { uid, name });
-        return { uid, name, email, photoURL, isAdmin, isHost: false, socketId: socket.id, ip };
+        return { uid, name, email, photoURL: profilePhoto, ...cosmetics, isAdmin, isHost: false, socketId: socket.id, ip };
     }
 
     socket.on('register_player_presence', async (data, callback) => {
@@ -1968,8 +2030,9 @@ io.on('connection', (socket) => {
 
             const isAdmin = Boolean(ADMIN_EMAIL && email.toLowerCase() === ADMIN_EMAIL);
             await assertPlayerAllowed(uid);
+            const cosmetics = await loadPlayerCosmetics(uid, photoURL);
             const ip = clientIp(socket);
-            socket.playerData = { uid, name, email, photoURL, isAdmin, ip };
+            socket.playerData = { uid, name, email, ...cosmetics, isAdmin, ip };
             trackConnection(socket, { uid, name });
             if (featureFlags.maintenanceMode && !isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
 
@@ -2354,6 +2417,7 @@ io.on('connection', (socket) => {
                             const isWinner = player.uid === winnerUid;
                             const winStreak = typeof userData.winStreak === 'number' ? userData.winStreak : 0;
                             const bestWinStreak = typeof userData.bestWinStreak === 'number' ? userData.bestWinStreak : 0;
+                            const progression = progressionForMatch(userData, isWinner);
                             transaction.set(userRef, {
                                 uid: player.uid,
                                 displayName: player.name,
@@ -2366,6 +2430,8 @@ io.on('connection', (socket) => {
                                 bestWinStreak: isWinner ? Math.max(bestWinStreak, winStreak + 1) : bestWinStreak,
                                 rankingPoints: FieldValue.increment(isWinner ? happyHourMultiplier : 0),
                                 happyHourWins: FieldValue.increment(isWinner && happyHourMultiplier > 1 ? 1 : 0),
+                                xp: FieldValue.increment(progression.xpEarned),
+                                achievementsUnlocked: progression.achievementsUnlocked,
                                 updatedAt,
                                 lastPlayedAt: updatedAt,
                             }, { merge: true });
@@ -2559,6 +2625,21 @@ io.on('connection', (socket) => {
     socket.on('admin_ban_user', (data, callback) => { void updateSocketBan(data, true, callback); });
     socket.on('admin_unban_user', (data, callback) => { void updateSocketBan(data, false, callback); });
 
+    /** Relay a validated table emote to the other players in the sender's active room. */
+    socket.on('player_emote', (data) => {
+        const roomId = String(data?.roomId || '');
+        const emote = String(data?.emote || '');
+        const uid = socket.playerData?.uid;
+        const game = activeGames[roomId];
+        const allowedEmotes = new Set(['laugh', 'fire', 'skull', 'brain', 'flag', 'lightning']);
+        if (!game || !uid || !allowedEmotes.has(emote) || !game.players.some((player) => player.uid === uid && player.socketId === socket.id)) return;
+        const now = Date.now();
+        if (socket.data.lastEmoteAt && now - socket.data.lastEmoteAt < 1200) return;
+        socket.data.lastEmoteAt = now;
+        socket.to(roomId).emit('opponent_emote', { roomId, uid, emote });
+    });
+
+    /** Remove queue, room, and ephemeral connection state after a socket disconnects. */
     socket.on('disconnect', async (reason) => {
         try {
             activeConnections.delete(socket.id);
