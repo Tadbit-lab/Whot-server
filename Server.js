@@ -2791,3 +2791,21 @@ featureFlagsReady.then(() => {
     log('💥', `Server startup failed: ${error.message}`);
     process.exit(1);
 });
+
+
+// --- FIRESTORE QUOTA 500 FALLBACK MIDDLEWARE ---
+const RESOURCE_EXHAUSTED_FALLBACK = (err, req, res, next) => {
+  if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
+    console.warn('⚠️ Intercepted Firestore quota error on ' + req.path + ' - returning degraded status 200 payload.');
+    return res.status(200).json({
+      degraded: true,
+      error: 'Firestore quota exceeded. System operating in degraded mode.',
+      players: [],
+      auditLogs: [],
+      securityLogs: [],
+      metrics: { activeMatches: 0, connectedPlayers: 0 }
+    });
+  }
+  next(err);
+};
+app.use('/api/admin', RESOURCE_EXHAUSTED_FALLBACK);
