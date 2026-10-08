@@ -1291,7 +1291,8 @@ async function persistAdminEndedGame(game, { winnerUid = null, resultType = 'for
                 bestWinStreak: won ? Math.max(best, streak + 1) : best,
                 rankingPoints: FieldValue.increment(won ? happyHourMultiplier : 0),
                 happyHourWins: FieldValue.increment(won && happyHourMultiplier > 1 ? 1 : 0),
-                xp: FieldValue.increment(progression.xpEarned),
+                rating: nextElo,
+                                xp: FieldValue.increment(progression.xpEarned),
                 achievementsUnlocked: progression.achievementsUnlocked,
                 updatedAt: new Date().toISOString(),
                 lastPlayedAt: new Date().toISOString(),
@@ -2862,6 +2863,9 @@ io.on('connection', (socket) => {
                             const winStreak = typeof userData.winStreak === 'number' ? userData.winStreak : 0;
                             const bestWinStreak = typeof userData.bestWinStreak === 'number' ? userData.bestWinStreak : 0;
                             const progression = progressionForMatch(userData, isWinner);
+                            const currentElo = typeof userData.rating === 'number' ? userData.rating : 1200;
+                            const eloDelta = isWinner ? (happyHourMultiplier > 1 ? 30 : 20) : -12;
+                            const nextElo = Math.max(800, Math.min(2200, currentElo + eloDelta));
                             transaction.set(userRef, {
                                 uid: player.uid,
                                 displayName: player.name,
