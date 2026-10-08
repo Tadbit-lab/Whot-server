@@ -1,4 +1,52 @@
 
+// --- LEGACY PLAYER ELO SEEDING FORMULA ---
+function calculateSeededElo(wins = 0, losses = 0) {
+  const total = wins + losses;
+  if (total === 0) return 1200; // New default
+
+  const winRate = wins / total;
+  const rawElo = 1200 + (wins * 15) - (losses * 10) + ((winRate - 0.5) * 200);
+
+  // Clamp between 800 and 1600
+  return Math.max(800, Math.min(1600, Math.round(rawElo)));
+}
+
+// Seed existing players in SQLite if rating column is missing or unseeded
+function seedLegacyPlayersInSqlite() {
+  if (!sqliteDb) return;
+  try {
+    // Add rating column if not exists
+    try {
+      sqliteDb.exec('ALTER TABLE players ADD COLUMN rating INTEGER DEFAULT 1200;');
+    } catch (e) {
+      // Column already exists
+    }
+
+    const unseeded = sqliteDb.prepare('SELECT uid, wins, losses, rating FROM players WHERE rating = 1200 OR rating IS NULL').all();
+    if (unseeded.length > 0) {
+      const updateStmt = sqliteDb.prepare('UPDATE players SET rating = ? WHERE uid = ?');
+      const seedTx = sqliteDb.transaction((rows) => {
+        rows.forEach(p => {
+          if (p.wins > 0 || p.losses > 0) {
+            const seededRating = calculateSeededElo(p.wins, p.losses);
+            updateStmt.run(seededRating, p.uid);
+          }
+        });
+      });
+      seedTx(unseeded);
+      console.log(`✅ Seeded ${unseeded.length} legacy players with performance-based Elo ratings!`);
+    }
+  } catch (err) {
+    console.warn('⚠️ Legacy Elo seeding notice:', err.message);
+  }
+}
+
+// Call seeding after SQLite init
+setTimeout(() => {
+  seedLegacyPlayersInSqlite();
+}, 3000);
+
+
 // ============================================================================
 // --- LOCAL SQLITE MIRROR ENGINE (SINGLETON, STABLE STATEMENT CACHING) ---
 // ============================================================================
