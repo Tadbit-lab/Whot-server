@@ -1,4 +1,134 @@
 
+// ============================================================================
+// --- LOCAL SQLITE MIRROR ENGINE (STABLE STATEMENT CACHING) ---
+// ============================================================================
+let sqliteDb = null;
+const STMT_CACHE = new Map();
+
+try {
+  const Database = require('better-sqlite3');
+  sqliteDb = new Database(require('path').join(__dirname, 'whot_local_mirror.db'));
+  sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS players (
+      uid TEXT PRIMARY KEY,
+      name TEXT,
+      photoURL TEXT,
+      wins INTEGER DEFAULT 0,
+      losses INTEGER DEFAULT 0,
+      lastSeen DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS matches (
+      id TEXT PRIMARY KEY,
+      winner TEXT,
+      playedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event TEXT,
+      details TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  console.log('⚡ Local SQLite mirror database initialized successfully!');
+} catch (err) {
+  console.warn('⚠️ SQLite initialization notice:', err.message);
+}
+
+// Statement Caching Helper (Prevents C++ Destructor GC crashes)
+function getPreparedStmt(sql) {
+  if (!sqliteDb) return null;
+  if (!STMT_CACHE.has(sql)) {
+    try {
+      STMT_CACHE.set(sql, sqliteDb.prepare(sql));
+    } catch (e) {
+      return null;
+    }
+  }
+  return STMT_CACHE.get(sql);
+}
+
+function sqliteUpsertPlayer(uid, name, photoURL = '', wins = 0, losses = 0) {
+  if (!sqliteDb || !uid) return;
+  const stmt = getPreparedStmt(`
+    INSERT INTO players (uid, name, photoURL, wins, losses, lastSeen)
+    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(uid) DO UPDATE SET
+      name = COALESCE(NULLIF(excluded.name, ''), players.name),
+      photoURL = COALESCE(NULLIF(excluded.photoURL, ''), players.photoURL),
+      wins = MAX(players.wins, excluded.wins),
+      losses = MAX(players.losses, excluded.losses),
+      lastSeen = CURRENT_TIMESTAMP
+  `);
+  if (stmt) {
+    try { stmt.run(uid, name || 'Player', photoURL || '', wins || 0, losses || 0); } catch (e) {}
+  }
+}
+
+function sqliteRecordMatch(id, winner) {
+  if (!sqliteDb || !id) return;
+  const stmt = getPreparedStmt('INSERT OR REPLACE INTO matches (id, winner) VALUES (?, ?)');
+  if (stmt) {
+    try { stmt.run(id, winner || 'Unknown'); } catch (e) {}
+  }
+}
+
+function sqliteLogAudit(event, details) {
+  if (!sqliteDb) return;
+  const stmt = getPreparedStmt('INSERT INTO audit_logs (event, details) VALUES (?, ?)');
+  if (stmt) {
+    try { stmt.run(event, typeof details === 'string' ? details : JSON.stringify(details)); } catch (e) {}
+  }
+}
+
+// Safe Historical Firestore Sync (Transaction Batching)
+async function syncHistoricalDataFromFirestore() {
+  if (!sqliteDb || typeof db === 'undefined' || !db) return;
+  
+  try {
+    const usersSnapshot = await db.collection('users').get();
+    let userCount = 0;
+    
+    // Run inside SQLite Transaction to prevent GC Statement locks
+    const syncUsersTx = sqliteDb.transaction((docs) => {
+      docs.forEach(doc => {
+        const data = doc.data();
+        sqliteUpsertPlayer(doc.id, data.displayName || 'Player', data.photoURL || '', data.wins || 0, data.losses || 0);
+        userCount++;
+      });
+    });
+
+    syncUsersTx(usersSnapshot.docs);
+    console.log(`✅ Synced ${userCount} past players from Firestore to local SQLite!`);
+  } catch (err) {
+    console.warn('⚠️ Firestore player sync notice:', err.message || err);
+  }
+
+  try {
+    const matchesSnapshot = await db.collection('matches').orderBy('playedAt', 'desc').limit(100).get();
+    let matchCount = 0;
+
+    const syncMatchesTx = sqliteDb.transaction((docs) => {
+      docs.forEach(doc => {
+        const data = doc.data();
+        const playedAtStr = data.playedAt ? (data.playedAt.toDate ? data.playedAt.toDate().toISOString() : data.playedAt) : new Date().toISOString();
+        sqliteRecordMatch(doc.id, data.winnerUid || data.winner || 'Unknown');
+        matchCount++;
+      });
+    });
+
+    syncMatchesTx(matchesSnapshot.docs);
+    console.log(`✅ Synced ${matchCount} past matches from Firestore to local SQLite!`);
+  } catch (err) {
+    console.warn('⚠️ Firestore match sync notice: Using existing SQLite records.');
+  }
+}
+
+setTimeout(() => {
+  syncHistoricalDataFromFirestore();
+}, 5000);
+// ============================================================================
+
+
 // --- IN-MEMORY SERVICE FLAGS (0ms TOGGLE / NO FIRESTORE DEPENDENCY) ---
 let SYSTEM_FLAGS_RAM = {
   maintenanceMode: false,
@@ -23,9 +153,6 @@ function isAdminEmail(email) {
 }
 
 
-// ============================================================================
-// --- LOCAL SQLITE MIRROR DATABASE ENGINE (0ms LATENCY / ZERO FIRESTORE QUOTA) ---
-// ============================================================================
 let sqliteDb = null;
 try {
   const Database = require('better-sqlite3');
@@ -91,38 +218,7 @@ function sqliteLogAudit(event, details) {
 }
 
 // Startup Firestore Hydration / Background Sync
-async function syncHistoricalDataFromFirestore() {
-  if (!sqliteDb || typeof db === 'undefined' || !db) return;
-  
-  // 1. Sync Past Players
-  try {
-    const usersSnapshot = await db.collection('users').get();
-    let userCount = 0;
-    usersSnapshot.forEach(doc => {
-      const data = doc.data();
-      sqliteUpsertPlayer(doc.id, data.displayName || 'Player', data.photoURL || '', data.wins || 0, data.losses || 0);
-      userCount++;
-    });
-    console.log(`✅ Synced ${userCount} past players from Firestore to local SQLite!`);
-  } catch (err) {
-    console.warn('⚠️ Firestore player sync notice:', err.message || err);
-  }
-
-  // 2. Sync Past Matches
-  try {
-    const matchesSnapshot = await db.collection('matches').orderBy('playedAt', 'desc').limit(100).get();
-    let matchCount = 0;
-    matchesSnapshot.forEach(doc => {
-      const data = doc.data();
-      const playedAtStr = data.playedAt ? (data.playedAt.toDate ? data.playedAt.toDate().toISOString() : data.playedAt) : new Date().toISOString();
-      sqliteRecordMatch(doc.id, data.winnerUid || data.winner || 'Unknown');
-      matchCount++;
-    });
-    console.log(`✅ Synced ${matchCount} past matches from Firestore to local SQLite!`);
-  } catch (err) {
-    console.warn('⚠️ Firestore match sync notice (Quota active or offline): Using existing SQLite match records.');
-  }
-}
+async 
 
 // Trigger background sync 5s after startup
 setTimeout(() => {
