@@ -1,4 +1,65 @@
 
+// ============================================================================
+// --- PLAYSTYLE MATRIX & ACHIEVEMENTS ENGINE ---
+// ============================================================================
+
+// Evaluate playstyle from turn event log at match end
+function evaluateMatchPlaystyle(turns = [], winnerUid) {
+  const stats = {};
+
+  turns.forEach(t => {
+    if (!t.actorUid) return;
+    if (!stats[t.actorUid]) {
+      stats[t.actorUid] = { penaltiesPlayed: 0, penaltyDefenses: 0, controlsPlayed: 0, shapeChanges: 0, totalTurns: 0 };
+    }
+    const s = stats[t.actorUid];
+    s.totalTurns++;
+
+    const val = t.card ? (t.card.value || t.card.number) : 0;
+    if (val === 2 || val === 5) s.penaltiesPlayed++;
+    if (val === 1 || val === 8) s.controlsPlayed++;
+    if (t.actionType === 'play_whot' || t.requestedShape) s.shapeChanges++;
+    if (t.grade === 'great' && (val === 2 || val === 5)) s.penaltyDefenses++;
+  });
+
+  const playstyleResults = {};
+  Object.keys(stats).forEach(uid => {
+    const s = stats[uid];
+    const tags = [];
+    if (s.penaltiesPlayed >= 3) tags.push('Aggressor');
+    if (s.penaltyDefenses >= 2) tags.push('Defender');
+    if (s.controlsPlayed >= 3) tags.push('Controller');
+    if (s.shapeChanges >= 3) tags.push('Chaos Agent');
+    if (tags.length === 0) tags.push('Balanced');
+
+    playstyleResults[uid] = {
+      primaryStyle: tags[0],
+      secondaryStyle: tags[1] || 'Tactician',
+      tags
+    };
+  });
+
+  return playstyleResults;
+}
+
+// Add SQLite columns for ratings and playstyles if missing
+function updateSqliteSchemaForEloAndPlaystyles() {
+  if (!sqliteDb) return;
+  try {
+    try { sqliteDb.exec('ALTER TABLE players ADD COLUMN rating INTEGER DEFAULT 1200;'); } catch (e) {}
+    try { sqliteDb.exec('ALTER TABLE players ADD COLUMN peakRating INTEGER DEFAULT 1200;'); } catch (e) {}
+    try { sqliteDb.exec('ALTER TABLE players ADD COLUMN primaryStyle TEXT DEFAULT "Balanced";'); } catch (e) {}
+  } catch (err) {
+    console.warn('SQLite schema update notice:', err.message);
+  }
+}
+
+setTimeout(() => {
+  updateSqliteSchemaForEloAndPlaystyles();
+}, 2000);
+// ============================================================================
+
+
 // --- LEGACY PLAYER ELO SEEDING FORMULA ---
 function calculateSeededElo(wins = 0, losses = 0) {
   const total = wins + losses;
