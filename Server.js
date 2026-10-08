@@ -1822,6 +1822,43 @@ app.get('/api/admin/announcements', adminAuth, (req, res) => {
     res.json({ announcements: pruneNotices() });
 });
 
+// --- ADMIN VOICE BROADCAST ENDPOINT ---
+app.post('/api/admin/broadcast-voice', adminAuth, async (req, res) => {
+  try {
+    const { audioData, durationSec, priority } = req.body || {};
+    if (!audioData) {
+      return res.status(400).json({ error: 'Audio payload is required' });
+    }
+
+    const payload = {
+      id: "voice-announcement-" + Date.now(),
+      type: 'voice',
+      audioUrl: audioData,
+      durationSec: Number(durationSec) || 0,
+      priority: priority || 'urgent',
+      message: 'Admin Voice Announcement',
+      createdAt: new Date().toISOString()
+    };
+
+    if (typeof io !== 'undefined' && io) {
+      io.emit('admin_voice_broadcast', payload);
+      io.emit('admin_broadcast', payload);
+    }
+
+    if (typeof auditAdminAction === 'function') {
+      try {
+        await auditAdminAction(req.admin, 'broadcast_voice_announcement', 'all_players', { durationSec, priority });
+      } catch (e) {}
+    }
+
+    return res.status(200).json({ success: true, payload });
+  } catch (err) {
+    console.error('❌ Error in /api/admin/broadcast-voice:', err.message || err);
+    return res.status(500).json({ error: 'Voice broadcast failed on server', details: err.message });
+  }
+});
+
+
 app.delete('/api/admin/announcements/:id', adminAuth, async (req, res, next) => {
     try {
         const id = String(req.params.id || '');
@@ -3072,41 +3109,7 @@ app.get('/api/admin/security', (req, res) => {
 
 
 // --- ADMIN VOICE BROADCAST ENDPOINT & SOCKET FANOUT ---
-app.post('/api/admin/broadcast-voice', adminAuth, async (req, res) => {
-  try {
-    const { audioData, durationSec, priority } = req.body || {};
-    if (!audioData) {
-      return res.status(400).json({ error: 'Audio payload is required' });
-    }
 
-    const payload = {
-      id: "voice-announcement-" + Date.now(),
-      type: 'voice',
-      audioUrl: audioData,
-      durationSec: Number(durationSec) || 0,
-      priority: priority || 'urgent',
-      message: 'Admin Voice Announcement',
-      createdAt: new Date().toISOString()
-    };
-
-    // Fan out to connected clients via Socket.io
-    if (typeof io !== 'undefined' && io) {
-      io.emit('admin_voice_broadcast', payload);
-      io.emit('admin_broadcast', payload);
-    }
-
-    if (typeof auditAdminAction === 'function') {
-      try {
-        await auditAdminAction(req.admin, 'broadcast_voice_announcement', 'all_players', { durationSec, priority });
-      } catch (e) {}
-    }
-
-    return res.status(200).json({ success: true, payload });
-  } catch (err) {
-    console.error('❌ Error in /api/admin/broadcast-voice:', err.message || err);
-    return res.status(500).json({ error: 'Voice broadcast failed on server', details: err.message });
-  }
-});
 
 
 // --- SERVICE FLAGS API ROUTES (RAM-BACKED) ---
