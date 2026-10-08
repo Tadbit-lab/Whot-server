@@ -237,7 +237,7 @@ app.use(cors({
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Authorization', 'Content-Type', 'x-admin-key', 'x-admin-token'],
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -3072,35 +3072,39 @@ app.get('/api/admin/security', (req, res) => {
 
 
 // --- ADMIN VOICE BROADCAST ENDPOINT & SOCKET FANOUT ---
-app.post('/api/admin/broadcast-voice', adminAuth, async (req, res, next) => {
+app.post('/api/admin/broadcast-voice', adminAuth, async (req, res) => {
   try {
     const { audioData, durationSec, priority } = req.body || {};
     if (!audioData) {
-      return res.status(400).json({ error: 'Audio payload required' });
+      return res.status(400).json({ error: 'Audio payload is required' });
     }
 
     const payload = {
-      id: `voice-announcement-${Date.now()}`,
+      id: "voice-announcement-" + Date.now(),
       type: 'voice',
-      audioUrl: audioData, // Base64 Data URI
-      durationSec: durationSec || 0,
+      audioUrl: audioData,
+      durationSec: Number(durationSec) || 0,
       priority: priority || 'urgent',
       message: 'Admin Voice Announcement',
       createdAt: new Date().toISOString()
     };
 
-    // Fan out to all connected clients via Socket.io
-    io.emit('admin_voice_broadcast', payload);
-    io.emit('admin_broadcast', payload);
+    // Fan out to connected clients via Socket.io
+    if (typeof io !== 'undefined' && io) {
+      io.emit('admin_voice_broadcast', payload);
+      io.emit('admin_broadcast', payload);
+    }
 
-    await auditAdminAction(req.admin, 'broadcast_voice_announcement', 'all_players', {
-      durationSec,
-      priority
-    });
+    if (typeof auditAdminAction === 'function') {
+      try {
+        await auditAdminAction(req.admin, 'broadcast_voice_announcement', 'all_players', { durationSec, priority });
+      } catch (e) {}
+    }
 
-    res.json({ success: true, payload });
+    return res.status(200).json({ success: true, payload });
   } catch (err) {
-    next(err);
+    console.error('❌ Error in /api/admin/broadcast-voice:', err.message || err);
+    return res.status(500).json({ error: 'Voice broadcast failed on server', details: err.message });
   }
 });
 
