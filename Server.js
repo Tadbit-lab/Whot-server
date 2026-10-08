@@ -1,6 +1,6 @@
 
 // ============================================================================
-// --- LOCAL SQLITE MIRROR ENGINE (STABLE STATEMENT CACHING) ---
+// --- LOCAL SQLITE MIRROR ENGINE (SINGLETON, STABLE STATEMENT CACHING) ---
 // ============================================================================
 let sqliteDb = null;
 const STMT_CACHE = new Map();
@@ -33,6 +33,56 @@ try {
 } catch (err) {
   console.warn('⚠️ SQLite initialization notice:', err.message);
 }
+
+// Statement Caching Helper (Prevents C++ Destructor GC crashes)
+function getPreparedStmt(sql) {
+  if (!sqliteDb) return null;
+  if (!STMT_CACHE.has(sql)) {
+    try {
+      STMT_CACHE.set(sql, sqliteDb.prepare(sql));
+    } catch (e) {
+      return null;
+    }
+  }
+  return STMT_CACHE.get(sql);
+}
+
+function sqliteUpsertPlayer(uid, name, photoURL = '', wins = 0, losses = 0) {
+  if (!sqliteDb || !uid) return;
+  const stmt = getPreparedStmt(`
+    INSERT INTO players (uid, name, photoURL, wins, losses, lastSeen)
+    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(uid) DO UPDATE SET
+      name = COALESCE(NULLIF(excluded.name, ''), players.name),
+      photoURL = COALESCE(NULLIF(excluded.photoURL, ''), players.photoURL),
+      wins = MAX(players.wins, excluded.wins),
+      losses = MAX(players.losses, excluded.losses),
+      lastSeen = CURRENT_TIMESTAMP
+  `);
+  if (stmt) {
+    try { stmt.run(uid, name || 'Player', photoURL || '', wins || 0, losses || 0); } catch (e) {}
+  }
+}
+
+function sqliteRecordMatch(id, winner) {
+  if (!sqliteDb || !id) return;
+  const stmt = getPreparedStmt('INSERT OR REPLACE INTO matches (id, winner) VALUES (?, ?)');
+  if (stmt) {
+    try { stmt.run(id, winner || 'Unknown'); } catch (e) {}
+  }
+}
+
+function sqliteLogAudit(event, details) {
+  if (!sqliteDb) return;
+  const stmt = getPreparedStmt('INSERT INTO audit_logs (event, details) VALUES (?, ?)');
+  if (stmt) {
+    try { stmt.run(event, typeof details === 'string' ? details : JSON.stringify(details)); } catch (e) {}
+  }
+}
+// ============================================================================
+
+
+
 
 // Statement Caching Helper (Prevents C++ Destructor GC crashes)
 function getPreparedStmt(sql) {
@@ -153,35 +203,7 @@ function isAdminEmail(email) {
 }
 
 
-let sqliteDb = null;
-try {
-  const Database = require('better-sqlite3');
-  sqliteDb = new Database(require('path').join(__dirname, 'whot_local_mirror.db'));
-  sqliteDb.exec(`
-    CREATE TABLE IF NOT EXISTS players (
-      uid TEXT PRIMARY KEY,
-      name TEXT,
-      photoURL TEXT,
-      wins INTEGER DEFAULT 0,
-      losses INTEGER DEFAULT 0,
-      lastSeen DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS matches (
-      id TEXT PRIMARY KEY,
-      winner TEXT,
-      playedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      event TEXT,
-      details TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-  console.log('⚡ Local SQLite mirror database initialized successfully!');
-} catch (err) {
-  console.warn('⚠️ SQLite initialization notice:', err.message);
-}
+
 
 // Helper Functions
 function sqliteUpsertPlayer(uid, name, photoURL = '', wins = 0, losses = 0) {
