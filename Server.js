@@ -1,4 +1,17 @@
 
+// --- IN-MEMORY SERVICE FLAGS (0ms TOGGLE / NO FIRESTORE DEPENDENCY) ---
+let SYSTEM_FLAGS_RAM = {
+  maintenanceMode: false,
+  voiceEnabled: true,
+  rankedEnabled: true,
+  maxPlayers: 6,
+  minStartingCards: 4,
+  maxStartingCards: 8,
+  autoFillQueueWithBots: false
+};
+let MATCHMAKING_PAUSED_RAM = false;
+
+
 // MULTI-ADMIN EMAIL HELPER
 function isAdminEmail(email) {
   if (!email) return false;
@@ -3089,4 +3102,34 @@ app.post('/api/admin/broadcast-voice', adminAuth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+
+// --- SERVICE FLAGS API ROUTES (RAM-BACKED) ---
+app.get('/api/admin/flags', adminAuth, (req, res) => {
+  res.json({ flags: SYSTEM_FLAGS_RAM, matchmakingPaused: MATCHMAKING_PAUSED_RAM });
+});
+
+app.post('/api/admin/flags', adminAuth, (req, res) => {
+  const { flags, matchmakingPaused } = req.body || {};
+  if (flags && typeof flags === 'object') {
+    SYSTEM_FLAGS_RAM = { ...SYSTEM_FLAGS_RAM, ...flags };
+  }
+  if (typeof matchmakingPaused === 'boolean') {
+    MATCHMAKING_PAUSED_RAM = matchmakingPaused;
+  }
+  console.log('⚡ Updated Service Flags in RAM:', SYSTEM_FLAGS_RAM);
+  res.json({ flags: SYSTEM_FLAGS_RAM, matchmakingPaused: MATCHMAKING_PAUSED_RAM });
+});
+
+app.post('/api/admin/matchmaking/pause', adminAuth, (req, res) => {
+  MATCHMAKING_PAUSED_RAM = !MATCHMAKING_PAUSED_RAM;
+  console.log('⚡ Matchmaking paused state toggled:', MATCHMAKING_PAUSED_RAM);
+  res.json({ matchmakingPaused: MATCHMAKING_PAUSED_RAM, flags: SYSTEM_FLAGS_RAM });
+});
+
+app.post('/api/admin/matchmaking/clear', adminAuth, (req, res) => {
+  if (Array.isArray(queue)) queue.length = 0;
+  console.log('⚡ Matchmaking queue cleared');
+  res.json({ queueSize: 0, success: true });
 });
