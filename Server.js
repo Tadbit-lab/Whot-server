@@ -1,5 +1,126 @@
 
 // ============================================================================
+// --- RANKED ELO ENGINE, K-FACTOR TUNING & SOFTMAX EVAL BAR ---
+// ============================================================================
+
+// 1. Dynamic K-Factor Tuning based on matches played and current rating
+function getKFactor(matchesPlayed = 0, rating = 1200) {
+  if (matchesPlayed < 10) return 40;  // Provisional: fast movement
+  if (matchesPlayed <= 50) return 24; // Established: balanced progression
+  if (rating >= 1600) return 16;      // Veteran / High-Tier: stable top ladder
+  return 24;
+}
+
+// 2. Pairwise Multi-Player FFA Elo Engine with Bot Cap Protection
+function calculatePairwiseEloDeltas(players, winnerUid, isBotMatch = false) {
+  const n = players.length;
+  if (n < 2) return {};
+
+  const deltas = {};
+  players.forEach(p => { deltas[p.uid] = 0; });
+
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const p1 = players[i];
+      const p2 = players[j];
+
+      const r1 = typeof p1.rating === 'number' ? p1.rating : 1200;
+      const r2 = typeof p2.rating === 'number' ? p2.rating : 1200;
+
+      // Bot Cap Rule: Stop gaining Elo against bots above 1300 rating
+      if (isBotMatch && r1 >= 1300 && p1.uid === winnerUid) continue;
+
+      const k1 = getKFactor(p1.matchesPlayed || 0, r1);
+      const k2 = getKFactor(p2.matchesPlayed || 0, r2);
+
+      // Expected win probability (Logistic curve)
+      const e1 = 1 / (1 + Math.pow(10, (r2 - r1) / 400));
+      const e2 = 1 - e1;
+
+      // Actual outcome score
+      let s1 = 0.5, s2 = 0.5;
+      if (p1.uid === winnerUid) { s1 = 1; s2 = 0; }
+      else if (p2.uid === winnerUid) { s1 = 0; s2 = 1; }
+      else if ((p1.placement || 2) < (p2.placement || 2)) { s1 = 1; s2 = 0; }
+      else if ((p1.placement || 2) > (p2.placement || 2)) { s1 = 0; s2 = 1; }
+
+      deltas[p1.uid] += k1 * (s1 - e1);
+      deltas[p2.uid] += k2 * (s2 - e2);
+    }
+  }
+
+  // Normalize by (N - 1) for Multi-player FFA
+  Object.keys(deltas).forEach(uid => {
+    deltas[uid] = Math.round(deltas[uid] / (n - 1));
+  });
+
+  return deltas;
+}
+
+// 3. Turn-by-Turn Win Probability ("Eval Bar") using Softmax
+function calculateTurnWinProbability(players, handsByUid, topCard, activeSuit) {
+  if (!players || !players.length) return {};
+
+  const scores = {};
+  
+  players.forEach(p => {
+    const hand = (handsByUid && handsByUid[p.uid]) ? handsByUid[p.uid] : [];
+    const handSize = hand.length;
+    
+    // 40% Weight: Fewer cards = higher win probability
+    let score = (15 - handSize) * 8;
+
+    // 35% Weight: Hand value & special tactical cards
+    hand.forEach(c => {
+      const val = c ? (c.value || c.number) : 0;
+      if (val === 20 || c?.suit === 'whot') score += 15; // Wild Whot 20
+      else if (val === 2 || val === 5) score += 10;     // Pick 2 / Pick 3 Penalties
+      else if (val === 1 || val === 8) score += 6;      // Hold On / Suspension Control
+      else if (val === 14) score += 5;                  // General Market
+      
+      // 15% Weight: Playable matching cards
+      if (activeSuit && c?.suit === activeSuit) score += 4;
+      else if (topCard && (c?.suit === topCard.suit || val === topCard.value)) score += 4;
+    });
+
+    // 10% Weight: Pre-match Elo skill execution factor
+    const rating = typeof p.rating === 'number' ? p.rating : 1200;
+    score += (rating - 1200) / 50;
+
+    scores[p.uid] = Math.max(1, score);
+  });
+
+  // Softmax Conversion to Win Percentages (Sum = 100%)
+  const expScores = {};
+  let expSum = 0;
+  
+  Object.keys(scores).forEach(uid => {
+    const exp = Math.exp(scores[uid] / 12);
+    expScores[uid] = exp;
+    expSum += exp;
+  });
+
+  const probabilities = {};
+  Object.keys(scores).forEach(uid => {
+    probabilities[uid] = Math.round((expScores[uid] / Math.max(1, expSum)) * 100);
+  });
+
+  return probabilities;
+}
+
+// Helper: Get Rank Tier Title & Theme Color
+function getRankTierInfo(rating = 1200) {
+  if (rating >= 1800) return { title: 'Elder', color: '#34d399', bg: 'rgba(52, 211, 153, 0.15)', border: '#34d399' };
+  if (rating >= 1600) return { title: 'Legend', color: '#c084fc', bg: 'rgba(192, 132, 252, 0.15)', border: '#c084fc' };
+  if (rating >= 1400) return { title: 'Captain', color: '#D4AF37', bg: 'rgba(212, 175, 55, 0.15)', border: '#D4AF37' };
+  if (rating >= 1200) return { title: 'Hustle', color: '#f3bd61', bg: 'rgba(243, 189, 97, 0.15)', border: '#f3bd61' };
+  if (rating >= 1000) return { title: 'Area', color: '#52cdb0', bg: 'rgba(82, 205, 176, 0.15)', border: '#52cdb0' };
+  return { title: 'Street', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.15)', border: '#94a3b8' };
+}
+// ============================================================================
+
+
+// ============================================================================
 // --- PLAYSTYLE MATRIX & ACHIEVEMENTS ENGINE ---
 // ============================================================================
 
