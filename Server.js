@@ -240,8 +240,6 @@ function sqliteLogAudit(event, details) {
 }
 
 // Startup Firestore Hydration / Background Sync
-async 
-
 // Trigger background sync 5s after startup
 setTimeout(() => {
   syncHistoricalDataFromFirestore();
