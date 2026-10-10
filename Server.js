@@ -109,13 +109,13 @@ function calculateTurnWinProbability(players, handsByUid, topCard, activeSuit) {
 }
 
 // Helper: Get Rank Tier Title & Theme Color
+// Bands: Slate(0-999), Teal(1000-1299), Amber(1300-1599), Gold(1600-1899), Ivory(1900+)
 function getRankTierInfo(rating = 1200) {
-  if (rating >= 1800) return { title: 'Elder', color: '#34d399', bg: 'rgba(52, 211, 153, 0.15)', border: '#34d399' };
-  if (rating >= 1600) return { title: 'Legend', color: '#c084fc', bg: 'rgba(192, 132, 252, 0.15)', border: '#c084fc' };
-  if (rating >= 1400) return { title: 'Captain', color: '#D4AF37', bg: 'rgba(212, 175, 55, 0.15)', border: '#D4AF37' };
-  if (rating >= 1200) return { title: 'Hustle', color: '#f3bd61', bg: 'rgba(243, 189, 97, 0.15)', border: '#f3bd61' };
-  if (rating >= 1000) return { title: 'Area', color: '#52cdb0', bg: 'rgba(82, 205, 176, 0.15)', border: '#52cdb0' };
-  return { title: 'Street', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.15)', border: '#94a3b8' };
+  if (rating >= 1900) return { title: 'Ivory', color: '#f0ede4', bg: 'rgba(240, 237, 228, 0.12)', border: '#c8c3b0' };
+  if (rating >= 1600) return { title: 'Gold',  color: '#D4AF37', bg: 'rgba(212, 175, 55, 0.15)',  border: '#a88a22' };
+  if (rating >= 1300) return { title: 'Amber', color: '#d4863a', bg: 'rgba(212, 134, 58, 0.15)',  border: '#a8622a' };
+  if (rating >= 1000) return { title: 'Teal',  color: '#52cdb0', bg: 'rgba(82, 205, 176, 0.12)',  border: '#3a9e85' };
+  return { title: 'Slate', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.10)', border: '#64748b' };
 }
 // ============================================================================
 
@@ -216,10 +216,10 @@ function seedLegacyPlayersInSqlite() {
         });
       });
       seedTx(unseeded);
-      console.log(`✅ Seeded ${unseeded.length} legacy players with performance-based Elo ratings!`);
+      console.log(`[OK] Seeded ${unseeded.length} legacy players with performance-based Elo ratings!`);
     }
   } catch (err) {
-    console.warn('⚠️ Legacy Elo seeding notice:', err.message);
+    console.warn('[WARN] Legacy Elo seeding notice:', err.message);
   }
 }
 
@@ -234,8 +234,11 @@ setTimeout(() => {
 // ============================================================================
 let sqliteDb = null;
 const STMT_CACHE = new Map();
+/** Enables local match/replay storage while Firebase remains the profile authority. */
+const USE_SQLITE_MATCHES = String(process.env.USE_SQLITE_MATCHES || '').toLowerCase() === 'true';
 
 try {
+  if (!USE_SQLITE_MATCHES) throw new Error('SQLite match store disabled');
   const Database = require('better-sqlite3');
   sqliteDb = new Database(require('path').join(__dirname, 'whot_local_mirror.db'));
   sqliteDb.exec(`
@@ -250,8 +253,13 @@ try {
     CREATE TABLE IF NOT EXISTS matches (
       id TEXT PRIMARY KEY,
       winner TEXT,
-      playedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+      playedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      roomId TEXT, mode TEXT, playersJson TEXT, participantUidsJson TEXT, status TEXT,
+      resultType TEXT, settingsJson TEXT, startedAt TEXT, endedAt TEXT,
+      durationSec INTEGER DEFAULT 0, totalMoves INTEGER DEFAULT 0,
+      analysisJson TEXT, finalSummaryJson TEXT
     );
+    CREATE TABLE IF NOT EXISTS turns (matchId TEXT NOT NULL, turnNumber INTEGER NOT NULL, payloadJson TEXT NOT NULL, timestamp TEXT NOT NULL, PRIMARY KEY (matchId, turnNumber));
     CREATE TABLE IF NOT EXISTS audit_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       event TEXT,
@@ -259,9 +267,33 @@ try {
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
-  console.log('⚡ Local SQLite mirror database initialized successfully!');
+  for (const column of ['roomId TEXT', 'mode TEXT', 'playersJson TEXT', 'participantUidsJson TEXT', 'status TEXT', 'resultType TEXT', 'settingsJson TEXT', 'startedAt TEXT', 'endedAt TEXT', 'durationSec INTEGER DEFAULT 0', 'totalMoves INTEGER DEFAULT 0', 'analysisJson TEXT', 'finalSummaryJson TEXT']) {
+    try { sqliteDb.exec(`ALTER TABLE matches ADD COLUMN ${column}`); } catch (_) { /* Existing local database already has this column. */ }
+  }
+  console.log('Local SQLite match store initialized successfully.');
 } catch (err) {
-  console.warn('⚠️ SQLite initialization notice:', err.message);
+  if (USE_SQLITE_MATCHES) console.warn('SQLite initialization notice:', err.message);
+}
+
+/** Flushes the RAM replay journal atomically at match completion. */
+function sqlitePersistReplay(match, turns) {
+  if (!USE_SQLITE_MATCHES || !sqliteDb) return false;
+  sqliteDb.transaction(() => {
+    sqliteDb.prepare(`INSERT OR REPLACE INTO matches (id, winner, playedAt, roomId, mode, playersJson, participantUidsJson, status, resultType, settingsJson, startedAt, endedAt, durationSec, totalMoves, analysisJson, finalSummaryJson) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(match.id, match.winnerUid, match.roomId, match.mode, JSON.stringify(match.players), JSON.stringify(match.participantUids), match.status, match.resultType, JSON.stringify(match.settings), match.startedAt, match.endedAt, match.durationSec, match.totalMoves, JSON.stringify(match.analysisReports), JSON.stringify(match.finalSummary));
+    const insertTurn = sqliteDb.prepare('INSERT OR REPLACE INTO turns (matchId, turnNumber, payloadJson, timestamp) VALUES (?, ?, ?, ?)');
+    for (const turn of turns) insertTurn.run(match.id, turn.turnNumber, JSON.stringify(turn), turn.timestamp || new Date().toISOString());
+  })();
+  return true;
+}
+
+/** Reads a local replay without a Firestore round-trip. */
+function sqliteReadReplay(matchId) {
+  if (!USE_SQLITE_MATCHES || !sqliteDb) return null;
+  const row = sqliteDb.prepare('SELECT * FROM matches WHERE id = ?').get(matchId);
+  if (!row) return null;
+  const parse = (value, fallback) => { try { return value ? JSON.parse(value) : fallback; } catch { return fallback; } };
+  return { match: { id: row.id, roomId: row.roomId, mode: row.mode, players: parse(row.playersJson, []), participantUids: parse(row.participantUidsJson, []), winnerUid: row.winner, status: row.status, resultType: row.resultType, settings: parse(row.settingsJson, {}), startedAt: row.startedAt, endedAt: row.endedAt, durationSec: row.durationSec, totalMoves: row.totalMoves, analysisReports: parse(row.analysisJson, []), finalSummary: parse(row.finalSummaryJson, {}) }, turns: sqliteDb.prepare('SELECT payloadJson FROM turns WHERE matchId = ? ORDER BY turnNumber ASC').all(matchId).map((turn) => parse(turn.payloadJson, {})) };
 }
 
 // Statement Caching Helper (Prevents C++ Destructor GC crashes)
@@ -311,58 +343,9 @@ function sqliteLogAudit(event, details) {
 }
 // ============================================================================
 
-
-
-
-// Statement Caching Helper (Prevents C++ Destructor GC crashes)
-function getPreparedStmt(sql) {
-  if (!sqliteDb) return null;
-  if (!STMT_CACHE.has(sql)) {
-    try {
-      STMT_CACHE.set(sql, sqliteDb.prepare(sql));
-    } catch (e) {
-      return null;
-    }
-  }
-  return STMT_CACHE.get(sql);
-}
-
-function sqliteUpsertPlayer(uid, name, photoURL = '', wins = 0, losses = 0) {
-  if (!sqliteDb || !uid) return;
-  const stmt = getPreparedStmt(`
-    INSERT INTO players (uid, name, photoURL, wins, losses, lastSeen)
-    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(uid) DO UPDATE SET
-      name = COALESCE(NULLIF(excluded.name, ''), players.name),
-      photoURL = COALESCE(NULLIF(excluded.photoURL, ''), players.photoURL),
-      wins = MAX(players.wins, excluded.wins),
-      losses = MAX(players.losses, excluded.losses),
-      lastSeen = CURRENT_TIMESTAMP
-  `);
-  if (stmt) {
-    try { stmt.run(uid, name || 'Player', photoURL || '', wins || 0, losses || 0); } catch (e) {}
-  }
-}
-
-function sqliteRecordMatch(id, winner) {
-  if (!sqliteDb || !id) return;
-  const stmt = getPreparedStmt('INSERT OR REPLACE INTO matches (id, winner) VALUES (?, ?)');
-  if (stmt) {
-    try { stmt.run(id, winner || 'Unknown'); } catch (e) {}
-  }
-}
-
-function sqliteLogAudit(event, details) {
-  if (!sqliteDb) return;
-  const stmt = getPreparedStmt('INSERT INTO audit_logs (event, details) VALUES (?, ?)');
-  if (stmt) {
-    try { stmt.run(event, typeof details === 'string' ? details : JSON.stringify(details)); } catch (e) {}
-  }
-}
-
 // Safe Historical Firestore Sync (Transaction Batching)
 async function syncHistoricalDataFromFirestore() {
-  if (!sqliteDb || typeof db === 'undefined' || !db) return;
+  if (!USE_SQLITE_MATCHES || !sqliteDb || typeof db === 'undefined' || !db) return;
   
   try {
     const usersSnapshot = await db.collection('users').get();
@@ -378,9 +361,9 @@ async function syncHistoricalDataFromFirestore() {
     });
 
     syncUsersTx(usersSnapshot.docs);
-    console.log(`✅ Synced ${userCount} past players from Firestore to local SQLite!`);
+    console.log(`[OK] Synced ${userCount} past players from Firestore to local SQLite!`);
   } catch (err) {
-    console.warn('⚠️ Firestore player sync notice:', err.message || err);
+    console.warn('[WARN] Firestore player sync notice:', err.message || err);
   }
 
   try {
@@ -397,9 +380,9 @@ async function syncHistoricalDataFromFirestore() {
     });
 
     syncMatchesTx(matchesSnapshot.docs);
-    console.log(`✅ Synced ${matchCount} past matches from Firestore to local SQLite!`);
+    console.log(`[OK] Synced ${matchCount} past matches from Firestore to local SQLite!`);
   } catch (err) {
-    console.warn('⚠️ Firestore match sync notice: Using existing SQLite records.');
+    console.warn('[WARN] Firestore match sync notice: Using existing SQLite records.');
   }
 }
 
@@ -501,7 +484,7 @@ function makeQuotaSafeHandler(handler, fallbackPayload = {}) {
 
 process.on('unhandledRejection', (reason, promise) => {
   if (reason && (reason.code === 8 || reason.message?.includes('RESOURCE_EXHAUSTED'))) {
-    console.warn('⚠️ Intercepted async Firestore quota exhaustion promise rejection.');
+    console.warn('[WARN] Intercepted async Firestore quota exhaustion promise rejection.');
     return;
   }
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -514,14 +497,14 @@ const safeAdminHandler = (handler, fallbackData = {}) => async (req, res, next) 
     await handler(req, res, next);
   } catch (err) {
     if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
-      console.warn(`⚠️ Firestore quota hit on ${req.path} - returning degraded fallback payload.`);
+      console.warn(`[WARN] Firestore quota hit on ${req.path} - returning degraded fallback payload.`);
       return res.status(200).json({
         degraded: true,
         error: 'Firestore quota limit exceeded. Operating in degraded mode.',
         ...fallbackData
       });
     }
-    console.error(`❌ Unhandled error on ${req.path}:`, err);
+    console.error(`[ERR] Unhandled error on ${req.path}:`, err);
     return res.status(200).json({ degraded: true, ...fallbackData });
   }
 };
@@ -570,9 +553,9 @@ try {
     FieldValue = fv;
 
     firebaseReady = true;
-    console.log('🔥 Firebase Admin SDK initialized successfully!');
+    console.log('[FIREBASE] Firebase Admin SDK initialized successfully!');
 } catch (err) {
-    console.warn('⚠️ Firebase Admin not initialized:', err.message);
+    console.warn('[WARN] Firebase Admin not initialized:', err.message);
     console.warn('   Server will still run, but token verification & Firestore writes are disabled.');
 }
 
@@ -596,6 +579,8 @@ const io = new Server(server, {
 // ─── Live Server State (RAM) ───
 const queue = [];
 const activeGames = {};
+const reconnectTimers = new Map();
+const RECONNECT_GRACE_MS = 30_000;
 /** In-memory tournament bracket state; durable tournament storage is not configured. */
 const tournaments = new Map();
 const securityLogs = [];
@@ -943,7 +928,7 @@ function auditAdminAction(actor, action, target, meta = {}) {
         timestamp: FieldValue.serverTimestamp(),
         meta,
     }).catch((error) => {
-        log('⚠️', `Admin audit write failed (${action}): ${error.message}`);
+        log('[WARN]', `Admin audit write failed (${action}): ${error.message}`);
     });
 }
 
@@ -1137,26 +1122,18 @@ function captureReplayContext(game, actorUid) {
 }
 
 function recordReplayTurn(game, event) {
-    if (!db || !game.matchId) return Promise.resolve();
+    if (!game.matchId) return Promise.resolve();
     game.replayTurnNumber = (game.replayTurnNumber || 0) + 1;
     const turn = replaySnapshot(game, event);
-    game.replayWrite = (game.replayWrite || Promise.resolve()).then(async () => {
-        await db.collection('matches').doc(game.matchId)
-            .collection('turns').doc(String(turn.turnNumber).padStart(6, '0')).set(turn);
-        await db.collection('matches').doc(game.matchId).set({
-            totalMoves: turn.turnNumber,
-            lastActionAt: turn.timestamp,
-        }, { merge: true });
-    }).catch((error) => {
-        log('⚠️', `Replay turn ${turn.turnNumber} write failed: ${error.message}`);
-    });
-    return game.replayWrite;
+    /** RAM-only journal: no persistence is performed while a game is live. */
+    game.replayTurns = game.replayTurns || [];
+    game.replayTurns.push(turn);
+    return Promise.resolve();
 }
 
 async function createReplayMatch(game) {
-    if (!db) return;
-    const matchRef = db.collection('matches').doc();
-    game.matchId = matchRef.id;
+    if (!USE_SQLITE_MATCHES && !db) return;
+    game.matchId = USE_SQLITE_MATCHES ? `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : db.collection('matches').doc().id;
     game.startedAt = new Date();
     game.replayTurnNumber = -1;
     const players = game.players.map((player, seatIndex) => ({
@@ -1167,23 +1144,6 @@ async function createReplayMatch(game) {
         seatIndex,
     }));
     game.matchPlayers = players;
-    await matchRef.set({
-        roomId: game.roomId,
-        mode: 'online',
-        players,
-        participantUids: players.map((player) => player.uid),
-        winnerUid: null,
-        starterUid: game.players[game.turnIndex]?.uid || null,
-        settings: {
-            startingCards: game.settings.startingHandSize,
-            decks: game.settings.decks,
-        },
-        ranked: game.ranked !== false,
-        createdAt: FieldValue.serverTimestamp(),
-        startedAt: FieldValue.serverTimestamp(),
-        status: 'playing',
-        totalMoves: 0,
-    });
     await recordReplayTurn(game, {
         actionType: 'game_start',
         actorUid: null,
@@ -1193,7 +1153,7 @@ async function createReplayMatch(game) {
 }
 
 async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'normal' } = {}) {
-    if (!db || !game.matchId) return;
+    if ((!USE_SQLITE_MATCHES && !db) || !game.matchId) return;
     if (game.replayFinalized) return game.replayFinalization || Promise.resolve();
     game.replayFinalized = true;
     game.replayFinalization = (async () => {
@@ -1203,7 +1163,6 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
             actorName: (game.matchPlayers || game.players).find((player) => player.uid === winnerUid)?.name || null,
             turnIndexBefore: game.turnIndex,
         });
-        await game.replayWrite;
         const endedAt = new Date();
         const analysisEvaluations = game.analysisEvaluations || [];
         const analysisReports = (game.matchPlayers || game.players).map((player) => {
@@ -1223,13 +1182,13 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
                     .map((entry) => `Move ${entry.turnNumber}: ${entry.insight}`),
             };
         });
-        await db.collection('matches').doc(game.matchId).set({
-            winnerUid,
-            endedAt: FieldValue.serverTimestamp(),
+        const completedMatch = {
+            id: game.matchId, roomId: game.roomId, mode: 'online', players: game.matchPlayers || game.players,
+            participantUids: (game.matchPlayers || game.players).map((player) => player.uid), winnerUid,
+            settings: { startingCards: game.settings.startingHandSize, decks: game.settings.decks },
+            startedAt: game.startedAt?.toISOString?.() || new Date().toISOString(), endedAt: endedAt.toISOString(),
             durationSec: game.startedAt ? Math.max(0, Math.floor((endedAt - game.startedAt) / 1000)) : 0,
-            totalMoves: Math.max(0, game.replayTurnNumber - 1),
-            resultType,
-            status: 'ended',
+            totalMoves: Math.max(0, game.replayTurnNumber - 1), resultType, status: 'ended',
             finalSummary: {
                 handCounts: Object.fromEntries((game.matchPlayers || game.players).map((player) => [
                     player.uid,
@@ -1238,7 +1197,9 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
                 analysisReports,
             },
             analysisReports,
-        }, { merge: true });
+        };
+        if (USE_SQLITE_MATCHES) sqlitePersistReplay(completedMatch, game.replayTurns || []);
+        else await db.collection('matches').doc(game.matchId).set({ ...completedMatch, createdAt: FieldValue.serverTimestamp(), endedAt: FieldValue.serverTimestamp() }, { merge: true });
     })();
     return game.replayFinalization;
 }
@@ -1302,7 +1263,7 @@ async function loadFeatureFlags() {
             happyHourIsActive();
         }
     } catch (error) {
-        log('⚠️', `Feature flag load failed: ${error.message}`);
+        log('[WARN]', `Feature flag load failed: ${error.message}`);
     }
 }
 
@@ -1426,6 +1387,7 @@ let cachedMatchMetrics = null;
 let cachedMatchMetricsAt = 0;
 const ADMIN_METRICS_CACHE_TTL = 15 * 60 * 1000;
 
+/** Cache-first observability snapshot; quota errors always degrade to RAM/cache data. */
 async function adminMetrics() {
     const rooms = Object.values(activeGames).map(publicRoomSummary);
     let gamesLast24h = 0;
@@ -1433,7 +1395,18 @@ async function adminMetrics() {
     let forfeitCount = metrics.forfeits;
     let degraded = false;
     let cached = false;
-    if (db) {
+    if (cachedMatchMetrics && Date.now() - cachedMatchMetricsAt <= ADMIN_METRICS_CACHE_TTL) {
+        ({ gamesLast24h, totalMatches, forfeitCount } = cachedMatchMetrics);
+        cached = true;
+    } else if (USE_SQLITE_MATCHES && sqliteDb) {
+        const row = sqliteDb.prepare(`SELECT COUNT(*) AS totalMatches, SUM(CASE WHEN resultType IS NOT NULL AND resultType != 'normal' THEN 1 ELSE 0 END) AS forfeitCount, SUM(CASE WHEN playedAt >= datetime('now', '-1 day') THEN 1 ELSE 0 END) AS gamesLast24h FROM matches`).get();
+        gamesLast24h = Number(row.gamesLast24h || 0);
+        totalMatches = Number(row.totalMatches || 0);
+        forfeitCount = Number(row.forfeitCount || 0);
+        cachedMatchMetrics = { gamesLast24h, totalMatches, forfeitCount };
+        cachedMatchMetricsAt = Date.now();
+        cached = true;
+    } else if (db) {
         try {
             const recentCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
             const recentMatches = await db.collection('matches')
@@ -1447,15 +1420,15 @@ async function adminMetrics() {
                 return Boolean(resultType && resultType !== 'normal');
             }).length;
         } catch (error) {
-            log('⚠️', `Admin match metrics query failed: ${error.message}`);
+            log('[WARN]', `Admin match metrics query failed: ${error.message}`);
             degraded = true;
             if (cachedMatchMetrics && Date.now() - cachedMatchMetricsAt <= ADMIN_METRICS_CACHE_TTL) {
                 ({ gamesLast24h, totalMatches, forfeitCount } = cachedMatchMetrics);
-                cached = true;
             }
+            cached = true;
         }
     }
-    if (db && !degraded) {
+    if (db && !degraded && !cached) {
         cachedMatchMetrics = { gamesLast24h, totalMatches, forfeitCount };
         cachedMatchMetricsAt = Date.now();
     }
@@ -1571,7 +1544,7 @@ async function loadPlayerCosmetics(uid, fallbackPhotoURL = null) {
             const snapshot = await db.collection('users').doc(uid).get();
             if (snapshot.exists) data = snapshot.data() || {};
         } catch (error) {
-            log('⚠️', `Could not load cosmetics for ${uid}: ${error.message}`);
+            log('[WARN]', `Could not load cosmetics for ${uid}: ${error.message}`);
         }
     }
     const allowed = (value, choices, fallback) => choices.includes(value) ? value : fallback;
@@ -1584,13 +1557,14 @@ async function loadPlayerCosmetics(uid, fallbackPhotoURL = null) {
         cardBackId: allowed(data.cardBackId, ['classic', 'ankara', 'gold_foil', 'midnight_neon', 'naija_stripe', 'obsidian'], 'classic'),
         tableThemeId: allowed(data.tableThemeId, ['lagos_green', 'warri_emerald', 'royal_gold', 'night_black'], 'lagos_green'),
         showcaseBadgeIds: Array.isArray(data.showcaseBadgeIds) ? data.showcaseBadgeIds.filter((id) => typeof id === 'string').slice(0, 3) : [],
+        rating: Number.isFinite(data.rating) ? Math.round(data.rating) : (Number.isFinite(data.elo) ? Math.round(data.elo) : 1200),
         photoURL: typeof data.photoURL === 'string' && (/^https:\/\/api\.dicebear\.com\/7\.x\/(bottts|identicon)\/svg\?seed=/.test(data.photoURL) || /^https:\/\/res\.cloudinary\.com\/[A-Za-z0-9_-]+\/image\/upload\//.test(data.photoURL)) ? data.photoURL : fallbackPhotoURL,
     };
 }
 
 function publicRoom(room) {
     syncHostState(room);
-    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, isHost, isAdmin, isBot, calledLastCard }) => ({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, isHost, isAdmin, isBot: Boolean(isBot), calledLastCard: Boolean(calledLastCard) })),
+    return { roomId: room.roomId, hostUid: room.hostUid, players: room.players.map(({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, rating, isHost, isAdmin, isBot, calledLastCard }) => ({ uid, name, photoURL, avatarId, avatarStyle, avatarFrameId, titleId, badgeId, cardBackId, tableThemeId, showcaseBadgeIds, rating, isHost, isAdmin, isBot: Boolean(isBot), calledLastCard: Boolean(calledLastCard) })),
         state: room.state, settings: room.settings, maxPlayers: room.settings.maxPlayers };
 }
 function broadcastRoom(room) {
@@ -1627,6 +1601,44 @@ function broadcastGameState(room) {
     });
     broadcastGhostSnapshots(room);
     scheduleBotTurn(room);
+}
+function reconnectKey(roomId, uid) {
+    return `${roomId}:${uid}`;
+}
+function clearReconnectGrace(roomId, uid) {
+    const key = reconnectKey(roomId, uid);
+    const timer = reconnectTimers.get(key);
+    if (timer) clearTimeout(timer);
+    reconnectTimers.delete(key);
+}
+async function expireReconnectGrace(roomId, uid) {
+    const room = activeGames[roomId];
+    const player = room?.players.find((entry) => entry.uid === uid);
+    if (!room || !player || !player.disconnectedAt) return;
+    clearReconnectGrace(roomId, uid);
+    const removedIndex = room.players.findIndex((entry) => entry.uid === uid);
+    room.players.splice(removedIndex, 1);
+    delete room.handsByUid?.[uid];
+    if (!room.players.length) {
+        delete activeGames[roomId];
+        return;
+    }
+    if (room.turnIndex >= room.players.length || removedIndex <= room.turnIndex) {
+        room.turnIndex = Math.max(0, room.turnIndex % room.players.length);
+    }
+    room.reconnectPaused = room.players.some((entry) => entry.disconnectedAt);
+    if (room.state === 'playing' && room.players.length === 1) {
+        room.state = 'ended';
+        room.status = 'ended';
+        room.winnerUid = room.players[0].uid;
+        await persistAdminEndedGame(room, { winnerUid: room.winnerUid, resultType: 'disconnect_forfeit' });
+        io.to(roomId).emit('game_ended', { roomId, winnerUid: room.winnerUid, matchId: room.matchId || null });
+        delete activeGames[roomId];
+        return;
+    }
+    io.to(roomId).emit('opponent_reconnect_expired', { roomId, uid });
+    broadcastGameState(room);
+    broadcastRoom(room);
 }
 function recycleMarket(room) {
     if (room.market.length || room.discardPile.length <= 1) return;
@@ -1794,7 +1806,7 @@ async function startBotFilledMatch(entry) {
     else if (deal.discardTop.value === 14) drawFromMarket(room, bot.uid, 1);
     metrics.gamesStarted += 1;
     metrics.lastGameAt = new Date().toISOString();
-    try { await createReplayMatch(room); } catch (error) { log('⚠️', `Bot match replay initialization failed: ${error.message}`); }
+    try { await createReplayMatch(room); } catch (error) { log('[WARN]', `Bot match replay initialization failed: ${error.message}`); }
     const payload = {
         roomId,
         matchId: room.matchId || null,
@@ -1811,7 +1823,7 @@ async function startBotFilledMatch(entry) {
     entry.socket.emit('game_started', payload);
     entry.socket.emit('initial_hand', { roomId, hand: deal.handsByUid[human.uid] || [] });
     broadcastGameState(room);
-    log('🤖', `Auto-filled queue entry ${human.uid} with ${bot.name} in ${roomId}.`);
+    log('[BOT]', `Auto-filled queue entry ${human.uid} with ${bot.name} in ${roomId}.`);
 }
 
 // ─── Self-Ping Keep-Alive (Prevents Render Sleeping) ───
@@ -1819,7 +1831,7 @@ function startSelfPing() {
     const targetUrl = process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL;
 
     if (!targetUrl) {
-        log('ℹ️', 'No RENDER_EXTERNAL_URL or SERVER_URL found. Self-ping skipped (normal for local dev).');
+        log('ℹ', 'No RENDER_EXTERNAL_URL or SERVER_URL found. Self-ping skipped (normal for local dev).');
         return;
     }
 
@@ -1830,12 +1842,12 @@ function startSelfPing() {
         try {
             const response = await fetch(healthEndpoint);
             if (response.ok) {
-                log('🏓', 'Self-ping successful. Server kept awake!');
+                log('[PING]', 'Self-ping successful. Server kept awake!');
             } else {
-                log('⚠️', `Self-ping responded with status: ${response.status}`);
+                log('[WARN]', `Self-ping responded with status: ${response.status}`);
             }
         } catch (err) {
-            log('⚠️', `Self-ping failed: ${err.message}`);
+            log('[WARN]', `Self-ping failed: ${err.message}`);
         }
     }, FOURTEEN_MINUTES_MS);
 }
@@ -1920,6 +1932,12 @@ app.get('/api/admin/rooms', adminAuth, (req, res) => {
 
 app.get('/api/admin/matches', adminAuth, async (req, res, next) => {
     try {
+        if (USE_SQLITE_MATCHES && sqliteDb) {
+            const requested = Number(req.query.limit) || 50;
+            const limit = Math.max(1, Math.min(100, requested));
+            const rows = sqliteDb.prepare('SELECT * FROM matches ORDER BY playedAt DESC LIMIT ?').all(limit);
+            return res.json({ matches: rows.map((row) => ({ id: row.id, roomId: row.roomId, winnerUid: row.winner, status: row.status, resultType: row.resultType, totalMoves: row.totalMoves, durationSec: row.durationSec, createdAt: row.startedAt || row.playedAt })) });
+        }
         if (!db) return res.status(503).json({ error: 'Match history is unavailable.' });
         const requested = Number(req.query.limit) || 50;
         const limit = Math.max(1, Math.min(100, requested));
@@ -1932,6 +1950,11 @@ app.get('/api/admin/matches', adminAuth, async (req, res, next) => {
 
 app.get('/api/admin/matches/:matchId/replay', adminAuth, async (req, res, next) => {
     try {
+        if (USE_SQLITE_MATCHES && sqliteDb) {
+            const replay = sqliteReadReplay(String(req.params.matchId));
+            if (!replay) return res.status(404).json({ error: 'Match not found.' });
+            return res.json(replay);
+        }
         if (!db) return res.status(503).json({ error: 'Replay storage is unavailable.' });
         const matchRef = db.collection('matches').doc(String(req.params.matchId));
         const [matchSnapshot, turnsSnapshot] = await Promise.all([
@@ -2200,7 +2223,7 @@ app.post('/api/admin/broadcast-voice', adminAuth, async (req, res) => {
 
     return res.status(200).json({ success: true, payload });
   } catch (err) {
-    console.error('❌ Error in /api/admin/broadcast-voice:', err.message || err);
+    console.error('[ERR] Error in /api/admin/broadcast-voice:', err.message || err);
     return res.status(500).json({ error: 'Voice broadcast failed on server', details: err.message });
   }
 });
@@ -2330,13 +2353,13 @@ app.use((req, res) => {
 
 // Express Error Handler
 app.use((err, req, res, next) => {
-    log('💥', `Express error: ${err.message}`);
+    log('[ERR]', `Express error: ${err.message}`);
     res.status(500).json({ error: 'Internal server error' });
 });
 
 // ─── Socket.io Gameplay ───
 io.on('connection', (socket) => {
-    log('🟢', `Player connected: ${socket.id}`);
+    log('[CONNECTED]', `Player connected: ${socket.id}`);
     socket.emit('server_announcements', pruneNotices());
     if (announcementIsActive(latestAnnouncement)) socket.emit('server_announcement', latestAnnouncement);
     socket.emit('feature_flags_updated', featureFlags);
@@ -2406,12 +2429,46 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('resume_game', async (playerData, callback) => {
+        try {
+            const freshPlayer = await resolveRoomPlayer(playerData);
+            const room = Object.values(activeGames).find((candidate) => candidate.state === 'playing'
+                && candidate.players.some((player) => player.uid === freshPlayer.uid && player.disconnectedAt));
+            if (!room) {
+                if (typeof callback === 'function') callback({ resumed: false });
+                return;
+            }
+            const player = room.players.find((entry) => entry.uid === freshPlayer.uid);
+            Object.assign(player, freshPlayer, { isHost: player.isHost, isBot: player.isBot, socketId: socket.id });
+            delete player.disconnectedAt;
+            clearReconnectGrace(room.roomId, player.uid);
+            room.reconnectPaused = room.players.some((entry) => entry.disconnectedAt);
+            socket.join(room.roomId);
+            socket.data.roomId = room.roomId;
+            socket.emit('game_started', {
+                roomId: room.roomId, matchId: room.matchId || null, players: publicRoom(room).players,
+                settings: room.settings, startingPlayerIndex: room.turnIndex,
+                startingPlayerUid: room.players[room.turnIndex]?.uid,
+                startsFirst: room.players[room.turnIndex]?.uid === player.uid,
+                discardTop: room.discardPile[room.discardPile.length - 1], marketCount: room.market.length,
+            });
+            socket.emit('hand_update', { roomId: room.roomId, hand: room.handsByUid[player.uid] || [] });
+            socket.emit('game_state', gameSnapshot(room));
+            io.to(room.roomId).emit('opponent_reconnected', { roomId: room.roomId, uid: player.uid });
+            broadcastGameState(room);
+            broadcastRoom(room);
+            if (typeof callback === 'function') callback({ resumed: true, roomId: room.roomId });
+        } catch (error) {
+            if (typeof callback === 'function') callback({ error: error.message || 'Could not resume the match.' });
+        }
+    });
+
     socket.on('create_room', async (playerData, callback) => {
         try {
             const player = await resolveRoomPlayer(playerData);
             if (featureFlags.maintenanceMode && !player.isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
             const roomId = String(playerData.roomId || '').trim().toUpperCase();
-            if (!isNonEmptyString(roomId, 24)) throw new Error('A valid room code is required.');
+            if (!/^[A-Z0-9]{4,6}$/.test(roomId)) throw new Error('Room codes must be 4–6 letters or numbers.');
             if (activeGames[roomId]) throw new Error('That room code is already in use.');
             player.isHost = true;
             const room = activeGames[roomId] = { roomId, hostUid: player.uid, players: [player], state: 'waiting',
@@ -2432,6 +2489,7 @@ io.on('connection', (socket) => {
             const player = await resolveRoomPlayer(playerData);
             if (featureFlags.maintenanceMode && !player.isAdmin) throw new Error('Online play is temporarily unavailable for maintenance.');
             const roomId = String(playerData.roomId || '').trim().toUpperCase();
+            if (!/^[A-Z0-9]{4,6}$/.test(roomId)) throw new Error('Room codes must be 4–6 letters or numbers.');
             const room = activeGames[roomId];
             if (!room || room.state !== 'waiting') throw new Error('Room not found or game already started.');
             if (room.players.length >= Math.min(room.settings.maxPlayers, featureFlags.maxPlayers)) {
@@ -2514,7 +2572,7 @@ io.on('connection', (socket) => {
         try {
             await createReplayMatch(room);
         } catch (error) {
-            log('⚠️', `Could not initialize match replay: ${error.message}`);
+            log('[WARN]', `Could not initialize match replay: ${error.message}`);
         }
         const payload = { roomId: room.roomId, matchId: room.matchId || null, players: publicRoom(room).players, settings: room.settings,
             startingPlayerIndex: room.turnIndex, startingPlayerUid: room.players[room.turnIndex].uid, startsFirst: room.players[room.turnIndex].uid === socket.playerData?.uid,
@@ -2643,7 +2701,7 @@ io.on('connection', (socket) => {
                 opponent.socket.data.roomId = roomId;
                 broadcastRoom(activeGames[roomId]);
 
-                log('🎮', `Waiting room created: ${roomId} (${roomPlayers.map((p) => p.name).join(' vs ')})`);
+                log('[GAME]', `Waiting room created: ${roomId} (${roomPlayers.map((p) => p.name).join(' vs ')})`);
                 if (typeof callback === 'function') callback({ success: true, roomId });
             } else {
                 queue.push({ socket, playerData: socket.playerData, joinedAt: new Date().toISOString() });
@@ -2652,7 +2710,7 @@ io.on('connection', (socket) => {
                 if (typeof callback === 'function') callback({ success: true, queued: true });
             }
         } catch (err) {
-            log('💥', `join_queue error: ${err.message}`);
+            log('[ERR]', `join_queue error: ${err.message}`);
             if (typeof callback === 'function') {
                 callback({ error: err.message || 'Server error while joining queue.' });
             }
@@ -2665,7 +2723,7 @@ io.on('connection', (socket) => {
         if (idx !== -1) {
             queue.splice(idx, 1);
             socket.emit('left_queue', { message: 'You left the matchmaking queue.' });
-            log('🚪', `${socket.playerData?.name || socket.id} left the queue.`);
+            log('[LEAVE]', `${socket.playerData?.name || socket.id} left the queue.`);
         }
     });
 
@@ -2680,7 +2738,7 @@ io.on('connection', (socket) => {
         if (!validateRoomAction(data)) return null;
         const game = activeGames[data.roomId];
         const actor = game.players.find((player) => player.socketId === socket.id);
-        if (!actor || game.state !== 'playing' || game.status !== 'playing' || game.adminPaused) return null;
+        if (!actor || game.state !== 'playing' || game.status !== 'playing' || game.adminPaused || game.reconnectPaused) return null;
         if (game.players[game.turnIndex]?.socketId !== socket.id) {
             recordSecurityEvent('OUT_OF_TURN_ACTION', 'WARNING', {
                 uid: actor.uid,
@@ -2790,7 +2848,7 @@ io.on('connection', (socket) => {
                 io.to(data.roomId).emit('game_ended', { roomId: data.roomId, winnerUid: actor.uid });
             }
             broadcastGameState(game);
-        } catch (err) { log('💥', `play_card error: ${err.message}`); }
+        } catch (err) { log('[ERR]', `play_card error: ${err.message}`); }
     });
 
     socket.on('draw_card', async (data) => {
@@ -2828,7 +2886,7 @@ io.on('connection', (socket) => {
             });
             socket.to(data.roomId).emit('opponent_drew_card', { roomId: data.roomId, playerId: actor.uid, count });
             broadcastGameState(game);
-        } catch (err) { log('💥', `draw_card error: ${err.message}`); }
+        } catch (err) { log('[ERR]', `draw_card error: ${err.message}`); }
     });
 
     socket.on('pass_turn', async (data) => {
@@ -2945,7 +3003,7 @@ io.on('connection', (socket) => {
 
             await finalizeReplayMatch(game, { winnerUid, resultType: 'normal' });
             metrics.gamesCompleted += 1;
-            if (db && FieldValue && game && game.ranked !== false) {
+            if (!USE_SQLITE_MATCHES && db && FieldValue && game && game.ranked !== false) {
                 try {
                     const happyHourMultiplier = happyHourIsActive() ? happyHour.multiplier : 1;
                     const playersByUid = new Map(
@@ -2962,7 +3020,7 @@ io.on('connection', (socket) => {
 
                     await db.runTransaction(async (transaction) => {
                         const userSnapshots = await Promise.all(userRefs.map((userRef) => transaction.get(userRef)));
-                        transaction.set(matchRef, {
+                        if (matchRef) transaction.set(matchRef, {
                             roomId: data.roomId,
                             players: game.matchPlayers || game.players.map((player) => ({
                                     uid: player.uid,
@@ -3006,16 +3064,16 @@ io.on('connection', (socket) => {
                             }, { merge: true });
                         });
                     });
-                    log('💾', `Match and leaderboard stats saved: ${data.roomId}`);
+                    log('[SAVE]', `Match and leaderboard stats saved: ${data.roomId}`);
                 } catch (saveErr) {
-                    log('⚠️', `Failed to save match and stats: ${saveErr.message}`);
+                    log('[WARN]', `Failed to save match and stats: ${saveErr.message}`);
                 }
             }
 
             delete activeGames[data.roomId];
-            log('🏁', `Game ended in ${data.roomId}. Room closed.`);
+            log('[END]', `Game ended in ${data.roomId}. Room closed.`);
         } catch (err) {
-            log('💥', `game_over error: ${err.message}`);
+            log('[ERR]', `game_over error: ${err.message}`);
         }
     });
 
@@ -3220,18 +3278,33 @@ io.on('connection', (socket) => {
             const qIdx = queue.findIndex((q) => q.socket.id === socket.id);
             if (qIdx !== -1) {
                 queue.splice(qIdx, 1);
-                log('🚪', `${socket.playerData?.name || socket.id} removed from queue (disconnect).`);
+                log('[LEAVE]', `${socket.playerData?.name || socket.id} removed from queue (disconnect).`);
             }
 
             for (const [roomId, game] of Object.entries(activeGames)) {
                 const player = game.players.find((p) => p.socketId === socket.id || p.uid === socket.playerData?.uid);
                 if (!player) continue;
 
+                if (game.state === 'playing') {
+                    player.socketId = null;
+                    player.disconnectedAt = new Date().toISOString();
+                    game.reconnectPaused = true;
+                    clearReconnectGrace(roomId, player.uid);
+                    reconnectTimers.set(reconnectKey(roomId, player.uid), setTimeout(() => {
+                        void expireReconnectGrace(roomId, player.uid);
+                    }, RECONNECT_GRACE_MS));
+                    io.to(roomId).emit('opponent_reconnecting', { roomId, uid: player.uid, graceMs: RECONNECT_GRACE_MS });
+                    broadcastGameState(game);
+                    broadcastRoom(game);
+                    log('RECONNECT', `${player.name} has ${RECONNECT_GRACE_MS / 1000}s to resume room ${roomId}.`);
+                    break;
+                }
+
                 game.players = game.players.filter((entry) => entry.socketId !== socket.id && entry.uid !== player.uid);
 
                 if (!game.players.length) {
                     delete activeGames[roomId];
-                    log('❌', `Room ${roomId} closed after last player disconnected (${reason}).`);
+                    log('[ERR]', `Room ${roomId} closed after last player disconnected (${reason}).`);
                     break;
                 }
 
@@ -3248,7 +3321,7 @@ io.on('connection', (socket) => {
                         });
                         await persistAdminEndedGame(game, { winnerUid: game.players[0].uid, resultType: 'disconnect_forfeit' });
                     } catch (error) {
-                        log('⚠️', `Disconnect result persistence failed: ${error.message}`);
+                        log('[WARN]', `Disconnect result persistence failed: ${error.message}`);
                     }
                     io.to(roomId).emit('game_ended', { roomId, winnerUid: game.players[0].uid, matchId: game.matchId || null });
                     broadcastRoom(game);
@@ -3281,13 +3354,13 @@ io.on('connection', (socket) => {
                     broadcastRoom(game);
                 }
 
-                log('🔴', `Player disconnected from room ${roomId}: ${player.name} (${reason})`);
+                log('[DISCONNECTED]', `Player disconnected from room ${roomId}: ${player.name} (${reason})`);
                 break;
             }
 
-            log('🔴', `Player disconnected: ${socket.id} (${reason})`);
+            log('[DISCONNECTED]', `Player disconnected: ${socket.id} (${reason})`);
         } catch (err) {
-            log('💥', `disconnect cleanup error: ${err.message}`);
+            log('[ERR]', `disconnect cleanup error: ${err.message}`);
         }
     });
 
@@ -3314,20 +3387,20 @@ io.on('connection', (socket) => {
             'disconnect',
         ];
         if (!knownEvents.includes(event)) {
-            log('⚠️', `Unknown event "${event}" from ${socket.id}`);
+            log('[WARN]', `Unknown event "${event}" from ${socket.id}`);
         }
     });
 });
 
 // ─── Graceful Shutdown ───
 function shutdown(signal) {
-    log('🛑', `${signal} received. Shutting down gracefully...`);
+    log('[SHUTDOWN]', `${signal} received. Shutting down gracefully...`);
     io.emit('server_shutdown', {
         message: 'Server is restarting. Please reconnect in a moment.',
     });
     io.close();
     server.close(() => {
-        log('✅', 'Server closed cleanly.');
+        log('[OK]', 'Server closed cleanly.');
         process.exit(0);
     });
     setTimeout(() => process.exit(1), 5000);
@@ -3338,9 +3411,9 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-        log('💥', `Port ${PORT} is already in use. Close the other process or change PORT.`);
+        log('[ERR]', `Port ${PORT} is already in use. Close the other process or change PORT.`);
     } else {
-        log('💥', `Server error: ${err.message}`);
+        log('[ERR]', `Server error: ${err.message}`);
     }
     process.exit(1);
 });
@@ -3348,16 +3421,16 @@ server.on('error', (err) => {
 // ─── Start Server & Activate Keep-Alive ───
 featureFlagsReady.then(() => {
     server.listen(PORT, () => {
-        log('🚀', `Whot Backend Server running on http://localhost:${PORT}`);
+        log('', `Whot Backend Server running on http://localhost:${PORT}`);
         log(
-            'ℹ️',
+            'ℹ',
             'REST: /  /health  /api/stats  /api/admin/* (Firebase administrator token required)'
         );
 
         startSelfPing();
     });
 }).catch((error) => {
-    log('💥', `Server startup failed: ${error.message}`);
+    log('[ERR]', `Server startup failed: ${error.message}`);
     process.exit(1);
 });
 
@@ -3365,7 +3438,7 @@ featureFlagsReady.then(() => {
 // --- FIRESTORE QUOTA 500 FALLBACK MIDDLEWARE ---
 const RESOURCE_EXHAUSTED_FALLBACK = (err, req, res, next) => {
   if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
-    console.warn('⚠️ Intercepted Firestore quota error on ' + req.path + ' - returning degraded status 200 payload.');
+    console.warn('[WARN] Intercepted Firestore quota error on ' + req.path + ' - returning degraded status 200 payload.');
     return res.status(200).json({
       degraded: true,
       error: 'Firestore quota exceeded. System operating in degraded mode.',
@@ -3384,7 +3457,7 @@ app.use('/api/admin', RESOURCE_EXHAUSTED_FALLBACK);
 app.use((err, req, res, next) => {
   // EXPRESS_QUOTA_PROTECTION
   if (err && (err.code === 8 || err.message?.includes('RESOURCE_EXHAUSTED') || err.message?.includes('Quota exceeded'))) {
-    console.warn('⚠️ Quota exceeded on ' + req.path + ' - returning degraded HTTP 200 payload.');
+    console.warn('[WARN] Quota exceeded on ' + req.path + ' - returning degraded HTTP 200 payload.');
     return res.status(200).json({
       degraded: true,
       error: 'Firestore quota limit reached. Operating in degraded mode.',
@@ -3415,49 +3488,6 @@ app.use(function (err, req, res, next) {
   return next(err);
 });
 
-
-// --- ADMIN ROUTES SERVED DIRECTLY FROM SQLITE (0ms / ZERO FIRESTORE READS) ---
-app.get('/api/admin/players', (req, res) => {
-  try {
-    let players = [];
-    if (sqliteDb) {
-      players = sqliteDb.prepare('SELECT * FROM players ORDER BY lastSeen DESC LIMIT 100').all();
-    }
-    return res.json({ players, source: 'sqlite_cache', degraded: false });
-  } catch (e) {
-    return res.json({ players: [], degraded: true });
-  }
-});
-
-app.get('/api/admin/matches', (req, res) => {
-  try {
-    let matches = [];
-    if (sqliteDb) {
-      matches = sqliteDb.prepare('SELECT * FROM matches ORDER BY playedAt DESC LIMIT 50').all();
-    }
-    return res.json({ matches, source: 'sqlite_cache', degraded: false });
-  } catch (e) {
-    return res.json({ matches: [], degraded: true });
-  }
-});
-
-app.get('/api/admin/audit', (req, res) => {
-  try {
-    let auditLogs = [];
-    if (sqliteDb) {
-      auditLogs = sqliteDb.prepare('SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50').all();
-    }
-    return res.json({ auditLogs, source: 'sqlite_cache', degraded: false });
-  } catch (e) {
-    return res.json({ auditLogs: [], degraded: true });
-  }
-});
-
-app.get('/api/admin/security', (req, res) => {
-  return res.json({ securityLogs: [], degraded: false });
-});
-
-
 // --- ADMIN VOICE BROADCAST ENDPOINT & SOCKET FANOUT ---
 
 
@@ -3475,18 +3505,18 @@ app.post('/api/admin/flags', adminAuth, (req, res) => {
   if (typeof matchmakingPaused === 'boolean') {
     MATCHMAKING_PAUSED_RAM = matchmakingPaused;
   }
-  console.log('⚡ Updated Service Flags in RAM:', SYSTEM_FLAGS_RAM);
+  console.log('[FLAGS] Updated Service Flags in RAM:', SYSTEM_FLAGS_RAM);
   res.json({ flags: SYSTEM_FLAGS_RAM, matchmakingPaused: MATCHMAKING_PAUSED_RAM });
 });
 
 app.post('/api/admin/matchmaking/pause', adminAuth, (req, res) => {
   MATCHMAKING_PAUSED_RAM = !MATCHMAKING_PAUSED_RAM;
-  console.log('⚡ Matchmaking paused state toggled:', MATCHMAKING_PAUSED_RAM);
+  console.log('[FLAGS] Matchmaking paused state toggled:', MATCHMAKING_PAUSED_RAM);
   res.json({ matchmakingPaused: MATCHMAKING_PAUSED_RAM, flags: SYSTEM_FLAGS_RAM });
 });
 
 app.post('/api/admin/matchmaking/clear', adminAuth, (req, res) => {
   if (Array.isArray(queue)) queue.length = 0;
-  console.log('⚡ Matchmaking queue cleared');
+  console.log('[FLAGS] Matchmaking queue cleared');
   res.json({ queueSize: 0, success: true });
 });
