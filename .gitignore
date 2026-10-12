@@ -5,4 +5,4 @@ serviceAccountKey.json
 # System / OS files
 .DS_Store
 Thumbs.db
-*.Zone.Identifier
+*.Zone.Identifier*.db
