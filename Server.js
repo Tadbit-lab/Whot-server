@@ -1194,6 +1194,10 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
                     player.uid,
                     (game.handsByUid?.[player.uid] || []).length,
                 ])),
+                handPoints: Object.fromEntries((game.matchPlayers || game.players).map((player) => [
+                    player.uid,
+                    calculateHandPoints(game.handsByUid?.[player.uid] || []),
+                ])),
                 analysisReports,
             },
             analysisReports,
@@ -1489,6 +1493,18 @@ const ACTION_LABELS = { 1: 'HOLD ON', 2: 'PICK TWO', 5: 'PICK THREE', 8: 'SUSPEN
 function cardNumber(card) { return Number(card?.value ?? card?.number); }
 function cardShape(card) { return String(card?.suit ?? card?.shape ?? '').toLowerCase(); }
 function isWildCard(card) { return card?.isWild === true || cardNumber(card) === 20; }
+function calculateCardPoints(card) {
+    if (!card) return 0;
+    const val = cardNumber(card);
+    const suit = cardShape(card);
+    if (val === 20 || suit === 'whot' || card?.isWild === true) return 20;
+    if (suit === 'stars' || suit === 'star') return val * 2;
+    return val;
+}
+function calculateHandPoints(hand) {
+    if (!Array.isArray(hand)) return 0;
+    return hand.reduce((sum, card) => sum + calculateCardPoints(card), 0);
+}
 function buildDeckPool(deckCount) {
     const deck = [];
     for (let copy = 0; copy < deckCount; copy += 1) {
@@ -1584,8 +1600,16 @@ function gameSnapshot(room) {
         discardTop: room.discardPile[room.discardPile.length - 1],
         discardPile: room.discardPile,
         activeSuit: room.activeSuit,
-        pendingPenalty: room.pendingPenalty,
-        penaltyType: room.penaltyType,
+        pendingPenalty: room.pendingPenalty || 0,
+        penaltyType: room.penaltyType || null,
+        pendingPenaltyChain: room.pendingPenalty > 0 ? {
+            type: room.penaltyType === 'three' ? 'PICK_THREE' : 'PICK_TWO',
+            count: room.pendingPenalty
+        } : null,
+        handPoints: Object.fromEntries(room.players.map((player) => [
+            player.uid,
+            calculateHandPoints(room.handsByUid[player.uid] || []),
+        ])),
         hasDrawnThisTurn: Boolean(room.hasDrawnThisTurn),
         marketCount: room.market.length,
         status: room.status || room.state,
@@ -1669,9 +1693,9 @@ function scheduleBotTurn(room) {
         const topValue = cardNumber(topCard);
         const activeShape = room.activeSuit ? String(room.activeSuit).toLowerCase() : null;
         const legalCards = hand.filter((card) => room.pendingPenalty > 0
-            ? isWildCard(card) || (room.penaltyType === 'two' ? cardNumber(card) === 2 : cardNumber(card) === 5)
+            ? (room.penaltyType === 'two' ? cardNumber(card) === 2 : cardNumber(card) === 5)
             : isWildCard(card) || (activeShape
-                ? cardShape(card) === activeShape || cardNumber(card) === topValue
+                ? cardShape(card) === activeShape || cardNumber(card) === 20
                 : cardShape(card) === cardShape(topCard) || cardNumber(card) === topValue));
         const actorIndex = room.turnIndex;
         const analysisContext = captureReplayContext(room, bot.uid);
@@ -2785,8 +2809,8 @@ io.on('connection', (socket) => {
             const topSuit = cardShape(topCard);
             const activeShape = game.activeSuit ? String(game.activeSuit).toLowerCase() : null;
             const legal = game.pendingPenalty > 0
-                ? wild || (game.penaltyType === 'two' ? cardValue === 2 : cardValue === 5)
-                : wild || (activeShape ? cardSuit === activeShape || cardValue === topValue : cardSuit === topSuit || cardValue === topValue);
+                ? (game.penaltyType === 'two' ? cardValue === 2 : cardValue === 5)
+                : wild || (activeShape ? cardSuit === activeShape || cardValue === 20 : cardSuit === topSuit || cardValue === topValue);
             if (!legal) { emitActionError(socket, 'That card cannot be played on the current discard.', 'game_action_error'); return; }
 
             metrics.cardsPlayed += 1;
@@ -2810,7 +2834,7 @@ io.on('connection', (socket) => {
                 if (cardValue === 2) { game.pendingPenalty += 2; game.penaltyType = 'two'; game.turnIndex = next; }
                 else if (cardValue === 5) { game.pendingPenalty += 3; game.penaltyType = 'three'; game.turnIndex = next; }
                 else if (cardValue === 1) { game.turnIndex = game.turnIndex; }
-                else if (cardValue === 8) { game.turnIndex = (game.turnIndex + (cardSuit === 'stars' ? 3 : 2)) % totalPlayers; }
+                else if (cardValue === 8) { game.turnIndex = (game.turnIndex + 2) % totalPlayers; }
                 else if (cardValue === 14) {
                     game.players.forEach((player) => { if (player.uid !== actor.uid) drawFromMarket(game, player.uid, 1); });
                     game.turnIndex = next;
@@ -2867,15 +2891,11 @@ io.on('connection', (socket) => {
             recordGameplayAction(socket, data, wasPenalty ? 'PENALTY_DRAW' : 'DRAW_CARD', { count });
             drawFromMarket(game, actor.uid, count);
             actor.calledLastCard = false;
-            if (game.pendingPenalty > 0) {
-                game.pendingPenalty = 0;
-                game.penaltyType = null;
-                game.hasDrawnThisTurn = false;
-                game.turnIndex = (game.turnIndex + 1) % game.players.length;
-                game.turnSerial = (game.turnSerial || 0) + 1;
-            } else {
-                game.hasDrawnThisTurn = true;
-            }
+            game.pendingPenalty = 0;
+            game.penaltyType = null;
+            game.hasDrawnThisTurn = false;
+            game.turnIndex = (game.turnIndex + 1) % game.players.length;
+            game.turnSerial = (game.turnSerial || 0) + 1;
             void recordReplayTurn(game, {
                 actionType: wasPenalty ? 'penalty_draw' : 'draw',
                 actorUid: actor.uid,
@@ -2995,10 +3015,15 @@ io.on('connection', (socket) => {
             }
             game.ending = true;
 
+            const handPoints = Object.fromEntries((game.matchPlayers || game.players).map((player) => [
+                player.uid,
+                calculateHandPoints(game.handsByUid?.[player.uid] || []),
+            ]));
             io.to(data.roomId).emit('game_ended', {
                 roomId: data.roomId,
                 winnerUid,
                 matchId: game.matchId || null,
+                handPoints,
             });
 
             await finalizeReplayMatch(game, { winnerUid, resultType: 'normal' });
