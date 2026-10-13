@@ -1202,8 +1202,19 @@ async function finalizeReplayMatch(game, { winnerUid = null, resultType = 'norma
             },
             analysisReports,
         };
-        if (USE_SQLITE_MATCHES) sqlitePersistReplay(completedMatch, game.replayTurns || []);
-        else await db.collection('matches').doc(game.matchId).set({ ...completedMatch, createdAt: FieldValue.serverTimestamp(), endedAt: FieldValue.serverTimestamp() }, { merge: true });
+        if (USE_SQLITE_MATCHES) {
+            sqlitePersistReplay(completedMatch, game.replayTurns || []);
+        } else if (db) {
+            const batch = db.batch();
+            const matchRef = db.collection("matches").doc(game.matchId);
+            batch.set(matchRef, { ...completedMatch, turns: game.replayTurns || [], createdAt: FieldValue.serverTimestamp(), endedAt: FieldValue.serverTimestamp() }, { merge: true });
+            const turnsRef = matchRef.collection("turns");
+            for (const turn of (game.replayTurns || [])) {
+                const turnId = String(turn.turnNumber || 0).padStart(6, "0");
+                batch.set(turnsRef.doc(turnId), turn);
+            }
+            await batch.commit();
+        }
     })();
     return game.replayFinalization;
 }
