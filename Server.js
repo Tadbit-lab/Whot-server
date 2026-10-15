@@ -1855,8 +1855,18 @@ async function startBotFilledMatch(entry) {
         gameState: gameSnapshot(room),
         botFilled: true,
     };
-    entry.socket.emit('game_started', payload);
-    entry.socket.emit('initial_hand', { roomId, hand: deal.handsByUid[human.uid] || [] });
+    // Find current active socket for human UID if socket reconnected
+    const activeSocket = Array.from(io.sockets.sockets.values()).find((s) => s.data?.uid === human.uid || s.uid === human.uid) || entry.socket;
+    if (activeSocket) {
+      activeSocket.join(roomId);
+      if (activeSocket.data) activeSocket.data.roomId = roomId;
+      activeSocket.emit("match_found", payload);
+      activeSocket.emit("game_started", payload);
+      activeSocket.emit("initial_hand", { roomId, hand: deal.handsByUid[human.uid] || [] });
+    }
+    io.to(roomId).emit("match_found", payload);
+    io.to(roomId).emit("game_started", payload);
+    io.to(roomId).emit("initial_hand", { roomId, hand: deal.handsByUid[human.uid] || [] });
     broadcastGameState(room);
     log('[BOT]', `Auto-filled queue entry ${human.uid} with ${bot.name} in ${roomId}.`);
 }
