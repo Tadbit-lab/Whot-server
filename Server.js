@@ -1915,11 +1915,27 @@ app.get('/api/stats', (req, res) => {
     res.json(getServerStats());
 });
 
-app.get('/api/admin/metrics', adminAuth, async (req, res, next) => {
+app.get("/api/admin/metrics", adminAuth, async (req, res) => {
     try {
-        res.json(await adminMetrics());
-    } catch (error) {
-        next(error);
+        const data = await adminMetrics();
+        res.json(data);
+    } catch (err) {
+        console.warn("[WARN] Admin metrics degraded due to quota/network:", err.message);
+        const rooms = Object.values(activeGames || {}).map(publicRoomSummary);
+        res.json({
+            activeRooms: rooms.length,
+            queueSize: (queue || []).length,
+            totalConnections: (io?.engine?.clientsCount) || 0,
+            uptimeSeconds: Math.floor(process.uptime()),
+            gamesLast24h: cachedMatchMetrics?.gamesLast24h || 0,
+            gamesStarted: metrics?.started || 0,
+            gamesCompleted: metrics?.completed || 0,
+            actionErrors: metrics?.errors || 0,
+            forfeitRate: metrics?.forfeits || 0,
+            memory: process.memoryUsage(),
+            cached: true,
+            degraded: true,
+        });
     }
 });
 
